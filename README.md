@@ -439,8 +439,25 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 
 | Tool | Description |
 |------|-------------|
-| `stock_screener` | List common or preferred stocks for any TradingView country market (america, korea, germany, brazil, …) with price, currency, % change, dividend yield — ranked by market cap. The API twin of TradingView's "Common stock" / "Preferred stock" symbol-search filter. |
+| `stock_screener` | List common or preferred stocks for any TradingView country market (america, korea, germany, brazil, …) with price, currency, % change, dividend yield — ranked by market cap. Optional **AND-combined fundamental filters** for multi-criteria screening (market cap range, revenue YoY growth, FCF, net debt/EBITDA, sector exclude, analyst-coverage proxy). The API twin of TradingView's "Common stock" / "Preferred stock" symbol-search filter. |
 | `stock_prices` | Direct price lookup for specific symbols (comma-separated `EXCHANGE:SYMBOL`, e.g. `NASDAQ:NVDA, KRX:005930`) — price, currency, daily % change, with unrecognized tickers named in `not_found`. |
+
+**Fundamental filter params** (all optional, AND-combined; verified against live `scanner.tradingview.com` metainfo):
+
+| Param | Scanner field | Notes |
+|------|---------------|-------|
+| `market_cap_min` / `market_cap_max` | `market_cap_basic` | USD |
+| `revenue_growth_yoy_min` | `total_revenue_yoy_growth_ttm` | Percent (15 = +15% YoY TTM) |
+| `fcf_positive` / `fcf_min` | `free_cash_flow_ttm` | USD; `fcf_min` wins if both set |
+| `net_debt_to_ebitda_max` | `net_debt_to_ebitda_fq` | Exclude banks/insurers via `sector_exclude` |
+| `sector_exclude` | `sector` | e.g. `["Finance"]` |
+| `analyst_count_max` | `recommendation_total` | Proxy only — see limitations |
+
+**Known API gaps / fragility**
+
+- There is **no** dedicated `number_of_analysts` field; `recommendation_total` (buy+hold+sell+over+under) is the closest proxy exposed as `analyst_count`.
+- There is **no** standalone FCF-yield field; when fundamentals are requested the response includes `price_free_cash_flow_ttm` (P/FCF) instead.
+- This tool calls TradingView's **undocumented** scanner endpoint (`https://scanner.tradingview.com/<market>/scan`). Field names, operators, or access can change or be rate-limited without notice — treat as a known breakage point for automation.
 
 ---
 
