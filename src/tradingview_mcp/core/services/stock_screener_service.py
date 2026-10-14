@@ -72,7 +72,10 @@ _LEGACY_FUNDAMENTAL_COLUMNS = (
 _EXTENDED_FUNDAMENTAL_COLUMNS = (
     "total_revenue_yoy_growth_fq",
     "total_revenue_ttm",
+    "total_revenue_fq",
     "gross_margin_ttm",
+    "gross_margin_fq",  # scanner field exists but is typically empty — see compute
+    "gross_profit_fq",
     "industry",
     "is_primary",
 )
@@ -81,9 +84,12 @@ _FUNDAMENTAL_COLUMNS = _LEGACY_FUNDAMENTAL_COLUMNS + _EXTENDED_FUNDAMENTAL_COLUM
 
 MAX_SCREEN_LIMIT = 2000
 MAX_PRICE_TICKERS = 2000
-# Over-fetch multiplier when post-filters (Ro40 / market_cap_usd) are active
-# so the TV .limit window is not the only search space.
+# Over-fetch multiplier when post-filters (Ro40 / market_cap_usd / GM FQ) are
+# active so the TV .limit window is not the only search space.
 _POST_FILTER_OVERFETCH_K = 5
+# Max scanner pages (offset rounds) when post-filtering and the first page
+# does not fill `limit` with passers.
+_POST_FILTER_MAX_PAGES = 3
 
 # sort_by -> scanner column (TV server-side). Computed sorts are handled
 # client-side after over-fetch (see _COMPUTED_SORT_FIELDS).
@@ -103,11 +109,17 @@ SORT_FIELDS = {
 _LEGACY_FUND_SORT_KEYS = frozenset({"revenue_growth", "fcf", "net_debt_ebitda"})
 
 # TODO-Dev 101 sort keys (trigger full extended audit payload).
-_NEW_SORT_KEYS = frozenset({"revenue_growth_fq", "gross_margin", "rule_of_40"})
+_NEW_SORT_KEYS = frozenset({
+    "revenue_growth_fq",
+    "gross_margin",
+    "gross_margin_fq",
+    "rule_of_40",
+})
 
 # sort_by values that exist only after client-side compute (post-sort).
 _COMPUTED_SORT_FIELDS = {
     "rule_of_40": "rule_of_40_fq",
+    "gross_margin_fq": "gross_margin_fq",
 }
 
 # Documented API gaps — legacy subset is BC-stable for pre-101 fund callers.
@@ -123,6 +135,16 @@ _LEGACY_API_LIMITATIONS = (
 _EXTENDED_API_LIMITATIONS = (
     "No previous-quarter revenue YoY on the scanner "
     "(total_revenue_yoy_growth_fq_1 etc. empty) — only latest FQ YoY.",
+    "gross_margin_ttm is TradingView scanner gross_margin_ttm "
+    "(= gross_profit_ttm / total_revenue_ttm). TV's Gross profit / Cost of "
+    "goods sold often includes depreciation & amortization that the issuer "
+    "reports below the gross-profit line (e.g. PAYS Q2'26: TV GM ~55% / "
+    "TTM ~52% vs company-reported ~63% / ~62%; delta ≈ D&A). CGNT (~73%) "
+    "and MNDY (~89%) match company figures — not a uniform scale bias. "
+    "Cannot be reconciled from the scanner alone.",
+    "gross_margin_fq scanner column is typically empty; we expose "
+    "gross_margin_fq computed as gross_profit_fq / total_revenue_fq "
+    "(same TV COGS definition). gross_margin_fq_min is a client post-filter.",
     "rule_of_40_min filters on rule_of_40_fq = FQ revenue YoY + TTM FCF "
     "margin (FCF remains TTM on the fq arm).",
     "market_cap (market_cap_basic) unit is market-dependent: america/"
@@ -130,10 +152,14 @@ _EXTENDED_API_LIMITATIONS = (
     "TV where there); other markets convert via FX_IDC:{CCY}USD into "
     "market_cap_usd and filter client-side only. Raw market_cap_min/max "
     "always filter market_cap_basic.",
-    "rule_of_40 / market_cap_usd post-filters (and sort_by=rule_of_40) run "
-    "on an over-fetched window (limit×K), not the full TV match set. "
-    "post_filter_incomplete=true means tv_total_matches > fetch_limit "
-    "(passers may exist outside the over-fetch window).",
+    "Post-filters (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min, "
+    "sort_by=rule_of_40|gross_margin_fq) over-fetch pages of size limit×K "
+    "and may page with offset (max "
+    f"{_POST_FILTER_MAX_PAGES} pages). post_filter_incomplete=true means "
+    "unscanned TV where-rows remain (passers may exist outside). On this "
+    "path total_matches is the passer count only when the TV where-set was "
+    "fully scanned; otherwise null (use tv_total_matches for the TV raw "
+    "where count).",
 )
 
 API_LIMITATIONS = _LEGACY_API_LIMITATIONS + _EXTENDED_API_LIMITATIONS
@@ -153,6 +179,7 @@ _EXTENDED_FUND_AUDIT_KEYS = _LEGACY_FUND_AUDIT_KEYS + (
     "revenue_growth_yoy_fq",
     "total_revenue_ttm",
     "gross_margin_ttm",
+    "gross_margin_fq",
     "fcf_margin_ttm",
     "rule_of_40_ttm",
     "rule_of_40_fq",
@@ -169,6 +196,7 @@ _NEW_RESPONSE_KEYS = frozenset({
     "revenue_growth_yoy_fq",
     "total_revenue_ttm",
     "gross_margin_ttm",
+    "gross_margin_fq",
     "fcf_margin_ttm",
     "rule_of_40_ttm",
     "rule_of_40_fq",
@@ -241,6 +269,7 @@ def _any_new_fundamental_filter(
     primary_only: Optional[bool],
     market_cap_usd_min: Optional[float],
     market_cap_usd_max: Optional[float],
+    gross_margin_fq_min: Optional[float] = None,
 ) -> bool:
     return any(
         v is not None
@@ -250,6 +279,7 @@ def _any_new_fundamental_filter(
             rule_of_40_min,
             market_cap_usd_min,
             market_cap_usd_max,
+            gross_margin_fq_min,
         )
     ) or bool(primary_only)
 
@@ -269,6 +299,7 @@ def _any_fundamental_filter(
     primary_only: Optional[bool] = None,
     market_cap_usd_min: Optional[float] = None,
     market_cap_usd_max: Optional[float] = None,
+    gross_margin_fq_min: Optional[float] = None,
 ) -> bool:
     return _any_legacy_fundamental_filter(
         market_cap_min,
@@ -286,6 +317,7 @@ def _any_fundamental_filter(
         primary_only,
         market_cap_usd_min,
         market_cap_usd_max,
+        gross_margin_fq_min,
     )
 
 
@@ -294,26 +326,41 @@ def _needs_post_filter(
     market_cap_usd_min: Optional[float],
     market_cap_usd_max: Optional[float],
     computed_sort: bool,
+    gross_margin_fq_min: Optional[float] = None,
 ) -> bool:
     return (
         rule_of_40_min is not None
         or market_cap_usd_min is not None
         or market_cap_usd_max is not None
+        or gross_margin_fq_min is not None
         or computed_sort
     )
 
 
-def _post_filter_incomplete(tv_total: int, fetch_limit: int) -> bool:
-    """True when the TV where-set is larger than the over-fetch window.
+def _post_filter_incomplete(scanned: int, tv_total: int) -> bool:
+    """True when unscanned TV where-rows remain after post-filter paging.
 
     Meaning: passers of client-side post-filters may exist outside the
-    fetched page. Independent of MAX_SCREEN_LIMIT and of whether the
-    returned page happened to be full.
+    scanned pages. Independent of whether the returned page was full.
     """
     try:
-        return int(tv_total) > int(fetch_limit)
+        return int(scanned) < int(tv_total)
     except (TypeError, ValueError):
         return False
+
+
+def _resolve_gross_margin_fq(row: dict[str, Any]) -> Optional[float]:
+    """Prefer scanner gross_margin_fq; else gross_profit_fq / total_revenue_fq."""
+    direct = _clean(row.get("gross_margin_fq"))
+    if direct is not None:
+        try:
+            return float(direct)
+        except (TypeError, ValueError):
+            pass
+    return _safe_div_pct(
+        _clean(row.get("gross_profit_fq")),
+        _clean(row.get("total_revenue_fq")),
+    )
 
 
 def _fx_ccy_from_scanner_row(row: dict[str, Any]) -> Optional[str]:
@@ -442,13 +489,17 @@ def screen_stocks(
     primary_only: bool = False,
     market_cap_usd_min: Optional[float] = None,
     market_cap_usd_max: Optional[float] = None,
+    gross_margin_fq_min: Optional[float] = None,
 ) -> dict[str, Any]:
     """Screen stocks of one share type for a country market.
 
-    Returns an envelope: total_matches / tv_total_matches is the market-wide
-    TV where count; rows are the top-N by sort_by. When post-filters
-    (rule_of_40_min, market_cap_usd_*) or computed sort are used, the scanner
-    over-fetches limit×K, then compute → filter → re-sort → truncate.
+    Returns an envelope: total_matches is the TV where count on non-post-filter
+    paths; on post-filter paths it is the passer count when the TV where-set
+    was fully scanned, else null (see tv_total_matches). Rows are the top-N
+    by sort_by. When post-filters (rule_of_40_min, market_cap_usd_*,
+    gross_margin_fq_min) or computed sort are used, the scanner over-fetches
+    pages of size limit×K (max 3 pages with offset), then compute → filter
+    → re-sort → truncate.
 
     Optional fundamental filters are AND-combined. Units (verified live):
       - market_cap_min/max : raw market_cap_basic (NOT always USD — see
@@ -456,7 +507,9 @@ def screen_stocks(
       - market_cap_usd_min/max : computed USD cap (post-filter)
       - revenue_growth_yoy_min : percent TTM (15 = +15% YoY TTM)
       - revenue_growth_yoy_fq_min : percent latest quarter YoY
-      - gross_margin_min : gross_margin_ttm percent
+      - gross_margin_min : gross_margin_ttm percent (TV COGS definition —
+        may include D&A; see API_LIMITATIONS)
+      - gross_margin_fq_min : computed gross_margin_fq percent (post-filter)
       - rule_of_40_min : rule_of_40_fq (FQ YoY + TTM FCF margin)
       - fcf_min / fcf_positive : free_cash_flow_ttm absolute
       - net_debt_to_ebitda_max : ratio on net_debt_to_ebitda_fq
@@ -518,6 +571,7 @@ def screen_stocks(
         primary_only,
         market_cap_usd_min,
         market_cap_usd_max,
+        gross_margin_fq_min,
     )
     # Extended payload iff any NEW filter or NEW sort key (incl. rule_of_40).
     extended_payload = new_filters or sort_key in _NEW_SORT_KEYS
@@ -536,6 +590,7 @@ def screen_stocks(
         market_cap_usd_min,
         market_cap_usd_max,
         computed_sort=computed_sort_col is not None,
+        gross_margin_fq_min=gross_margin_fq_min,
     )
 
     if market_cap_min is not None and market_cap_max is not None:
@@ -646,18 +701,6 @@ def screen_stocks(
     if needs_post:
         fetch_limit = min(MAX_SCREEN_LIMIT, limit * _POST_FILTER_OVERFETCH_K)
 
-    query = (
-        Query()
-        .set_markets(country)
-        .select(*select_cols)
-        .where(*filters)
-        .order_by(tv_order_col, ascending=False)
-        .limit(fetch_limit)
-    )
-    # get_scanner_data forwards kwargs to requests.post, which has no default
-    # timeout — a stalled endpoint would hang the worker thread forever.
-    total, df = query.get_scanner_data(timeout=20)
-
     applied_filters: dict[str, Any] = {}
     if market_cap_min is not None:
         applied_filters["market_cap_min"] = float(market_cap_min)
@@ -671,6 +714,8 @@ def screen_stocks(
         )
     if gross_margin_min is not None:
         applied_filters["gross_margin_min"] = float(gross_margin_min)
+    if gross_margin_fq_min is not None:
+        applied_filters["gross_margin_fq_min"] = float(gross_margin_fq_min)
     if rule_of_40_min is not None:
         applied_filters["rule_of_40_min"] = float(rule_of_40_min)
     if market_cap_usd_min is not None:
@@ -690,21 +735,11 @@ def screen_stocks(
     if analyst_count_max is not None:
         applied_filters["analyst_count_max"] = float(analyst_count_max)
 
-    raw_records = df.to_dict("records")
-    fx_notes: list[str] = []
-    fx_rates: dict[str, Optional[float]] = {"USD": 1.0}
-    if extended_payload:
-        currencies = [_clean(r.get("currency")) for r in raw_records]
-        need_fx = country not in _USD_NORMALIZED_MARKETS and any(
-            c and str(c).upper() != "USD" for c in currencies
-        )
-        if need_fx:
-            fx_rates = _fetch_fx_to_usd(
-                [str(c) for c in currencies if c is not None]
-            )
-
-    rows: list[dict[str, Any]] = []
-    for r in raw_records:
+    def _row_from_raw(
+        r: dict[str, Any],
+        fx_rates: dict[str, Optional[float]],
+        fx_notes: list[str],
+    ) -> dict[str, Any]:
         market_cap = _clean(r.get("market_cap_basic"))
         currency = _clean(r.get("currency"))
         row: dict[str, Any] = {
@@ -731,6 +766,7 @@ def screen_stocks(
             row["revenue_growth_yoy_fq"] = rev_fq
             row["total_revenue_ttm"] = revenue_ttm
             row["gross_margin_ttm"] = _clean(r.get("gross_margin_ttm"))
+            row["gross_margin_fq"] = _resolve_gross_margin_fq(r)
             row["free_cash_flow_ttm"] = fcf
             row["price_free_cash_flow_ttm"] = _clean(
                 r.get("price_free_cash_flow_ttm")
@@ -761,34 +797,105 @@ def screen_stocks(
             row["net_debt_to_ebitda_fq"] = _clean(r.get("net_debt_to_ebitda_fq"))
             row["sector"] = _clean(r.get("sector"))
             row["analyst_count"] = _clean(r.get("recommendation_total"))
-        rows.append(row)
+        return row
 
+    def _passes_post(row: dict[str, Any]) -> bool:
+        if rule_of_40_min is not None:
+            ro40 = row.get("rule_of_40_fq")
+            if ro40 is None or float(ro40) < float(rule_of_40_min):
+                return False
+        if market_cap_usd_min is not None:
+            mu = row.get("market_cap_usd")
+            if mu is None or float(mu) < float(market_cap_usd_min):
+                return False
+        if market_cap_usd_max is not None:
+            mu = row.get("market_cap_usd")
+            if mu is None or float(mu) > float(market_cap_usd_max):
+                return False
+        if gross_margin_fq_min is not None:
+            gm_fq = row.get("gross_margin_fq")
+            if gm_fq is None or float(gm_fq) < float(gross_margin_fq_min):
+                return False
+        return True
+
+    fx_notes: list[str] = []
+    fx_rates: dict[str, Optional[float]] = {"USD": 1.0}
+    rows: list[dict[str, Any]] = []
+    total = 0
+    scanned = 0
     post_filter_incomplete = False
-    if needs_post:
-        filtered: list[dict[str, Any]] = []
-        for row in rows:
-            if rule_of_40_min is not None:
-                ro40 = row.get("rule_of_40_fq")
-                if ro40 is None or float(ro40) < float(rule_of_40_min):
-                    continue
-            if market_cap_usd_min is not None:
-                mu = row.get("market_cap_usd")
-                if mu is None or float(mu) < float(market_cap_usd_min):
-                    continue
-            if market_cap_usd_max is not None:
-                mu = row.get("market_cap_usd")
-                if mu is None or float(mu) > float(market_cap_usd_max):
-                    continue
-            filtered.append(row)
-        # Incomplete iff TV where-set is larger than the over-fetch window
-        # (passers may exist outside the page). Uses tv total, not page fullness.
-        post_filter_incomplete = _post_filter_incomplete(total, fetch_limit)
-        rows = filtered
+    passer_count: Optional[int] = None
 
+    max_pages = _POST_FILTER_MAX_PAGES if needs_post else 1
+    offset = 0
+    seen: set[str] = set()
+    passers: list[dict[str, Any]] = []
+
+    for _page in range(max_pages):
+        query = (
+            Query()
+            .set_markets(country)
+            .select(*select_cols)
+            .where(*filters)
+            .order_by(tv_order_col, ascending=False)
+            .offset(offset)
+            .limit(fetch_limit)
+        )
+        # get_scanner_data forwards kwargs to requests.post, which has no
+        # default timeout — a stalled endpoint would hang forever.
+        total, df = query.get_scanner_data(timeout=20)
+        raw_records = df.to_dict("records")
+        if not raw_records:
+            break
+
+        if extended_payload and _page == 0:
+            currencies = [_clean(r.get("currency")) for r in raw_records]
+            need_fx = country not in _USD_NORMALIZED_MARKETS and any(
+                c and str(c).upper() != "USD" for c in currencies
+            )
+            if need_fx:
+                fx_rates = _fetch_fx_to_usd(
+                    [str(c) for c in currencies if c is not None]
+                )
+        elif extended_payload and country not in _USD_NORMALIZED_MARKETS:
+            # Later pages may introduce new quote currencies.
+            page_ccys = [
+                str(c)
+                for c in (_clean(r.get("currency")) for r in raw_records)
+                if c and str(c).upper() != "USD" and str(c).upper() not in fx_rates
+            ]
+            if page_ccys:
+                more = _fetch_fx_to_usd(page_ccys)
+                fx_rates.update(more)
+
+        page_rows = [_row_from_raw(r, fx_rates, fx_notes) for r in raw_records]
+        scanned += len(page_rows)
+        offset += len(raw_records)
+
+        if needs_post:
+            for row in page_rows:
+                ticker = str(row.get("ticker") or "")
+                if ticker and ticker in seen:
+                    continue
+                if ticker:
+                    seen.add(ticker)
+                if _passes_post(row):
+                    passers.append(row)
+            # Continue paging only while under limit and TV rows remain.
+            if len(passers) >= limit or scanned >= int(total):
+                break
+        else:
+            rows = page_rows
+            break
+
+    if needs_post:
+        post_filter_incomplete = _post_filter_incomplete(scanned, total)
         # Re-sort after post-filter (especially for computed sort_by).
         sort_row_key = computed_sort_col
         if sort_row_key is None and sort_key == "gross_margin":
             sort_row_key = "gross_margin_ttm"
+        elif sort_row_key is None and sort_key == "gross_margin_fq":
+            sort_row_key = "gross_margin_fq"
         elif sort_row_key is None and sort_key == "revenue_growth_fq":
             sort_row_key = "revenue_growth_yoy_fq"
         elif sort_row_key is None and sort_key == "revenue_growth":
@@ -817,9 +924,10 @@ def screen_stocks(
                 except (TypeError, ValueError):
                     return float("-inf")
 
-            rows.sort(key=_sort_val, reverse=True)
+            passers.sort(key=_sort_val, reverse=True)
 
-        rows = rows[:limit]
+        passer_count = len(passers) if not post_filter_incomplete else None
+        rows = passers[:limit]
     # When no post-filter, TV already limited to `limit`.
 
     if compact:
@@ -836,7 +944,7 @@ def screen_stocks(
         "exclude_otc": exclude_otc,
         "sort_by": sort_key,
         "filters_applied": applied_filters,
-        "total_matches": total,
+        "total_matches": passer_count if needs_post else total,
         "returned": len(rows),
         "rows": rows,
     }
@@ -849,6 +957,12 @@ def screen_stocks(
     if extended_payload:
         limitations = list(API_LIMITATIONS)
         limitations.extend(fx_notes)
+        if needs_post and post_filter_incomplete:
+            limitations.append(
+                "total_matches is null because post-filter paging did not "
+                "exhaust the TV where-set; tv_total_matches is the TV raw "
+                "where count (not the passer count)."
+            )
         result["api_limitations"] = limitations
     elif legacy_payload:
         result["api_limitations"] = list(_LEGACY_API_LIMITATIONS)

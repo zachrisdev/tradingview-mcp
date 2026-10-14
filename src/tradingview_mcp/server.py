@@ -1125,6 +1125,7 @@ async def stock_screener(
     primary_only: bool = False,
     market_cap_usd_min: float | None = None,
     market_cap_usd_max: float | None = None,
+    gross_margin_fq_min: float | None = None,
 ) -> dict:
     """Screen stocks by share type — the API twin of TradingView's
     "Common stock" / "Preferred stock" symbol-search filter.
@@ -1144,10 +1145,10 @@ async def stock_screener(
             change_percent per row (light payload for bulk price feeds); when
             fundamental filters are used, those audit columns are kept
         sort_by: market_cap (default) | dividend_yield | change | price |
-            revenue_growth | revenue_growth_fq | gross_margin | fcf |
-            net_debt_ebitda | rule_of_40. TV-column sorts are server-side over
-            the TV where set; rule_of_40 is client post-sort on an over-fetched
-            window (not a full-market guarantee)
+            revenue_growth | revenue_growth_fq | gross_margin | gross_margin_fq |
+            fcf | net_debt_ebitda | rule_of_40. TV-column sorts are server-side
+            over the TV where set; rule_of_40 / gross_margin_fq are client
+            post-sorts on over-fetched pages (not a full-market guarantee)
         market_cap_min / market_cap_max: raw market_cap_basic (NOT always USD —
             sweden etc. are local; use market_cap_usd_* for USD caps)
         market_cap_usd_min / market_cap_usd_max: computed USD cap post-filter
@@ -1155,7 +1156,12 @@ async def stock_screener(
         revenue_growth_yoy_min: min total_revenue_yoy_growth_ttm in percent
             (15 means +15% YoY TTM)
         revenue_growth_yoy_fq_min: min latest-quarter revenue YoY percent
-        gross_margin_min: min gross_margin_ttm percent
+        gross_margin_min: min gross_margin_ttm percent (TV Gross profit /
+            revenue; TV COGS may include D&A that issuers report below GP —
+            e.g. PAYS TV ~52% TTM vs company ~62%; CGNT/MNDY match company)
+        gross_margin_fq_min: min computed gross_margin_fq percent
+            (gross_profit_fq / total_revenue_fq; scanner gross_margin_fq is
+            typically empty) — client post-filter
         rule_of_40_min: min rule_of_40_fq (= FQ YoY + TTM FCF margin); post-filter
         fcf_positive: if True, require free_cash_flow_ttm > 0; if False, <= 0.
             Ignored when fcf_min is set (fcf_min is the stricter floor)
@@ -1167,6 +1173,7 @@ async def stock_screener(
             API LIMITATION: no number_of_analysts field — this is the closest
             proxy. No standalone FCF-yield; price_free_cash_flow_ttm (P/FCF)
             is returned instead. No previous-quarter revenue YoY on scanner.
+            TV gross_margin_* uses TV COGS (may include D&A).
         primary_only: if True, require is_primary (common only — preferred raises)
 
     Fragility: uses TradingView's undocumented scanner API
@@ -1174,9 +1181,10 @@ async def stock_screener(
     or be rate-limited without notice.
 
     Returns:
-        Envelope: total_matches / tv_total_matches, returned, filters_applied,
+        Envelope: total_matches (TV where count, or passer count / null on
+        post-filter paths), tv_total_matches, returned, filters_applied,
         rows with base price fields plus — when any fundamental filter is set —
-        revenue_growth_yoy_ttm/fq, total_revenue_ttm, gross_margin_ttm,
+        revenue_growth_yoy_ttm/fq, total_revenue_ttm, gross_margin_ttm/fq,
         free_cash_flow_ttm, fcf_margin_ttm, rule_of_40_ttm/fq, market_cap_usd,
         industry, is_primary, sector, analyst_count, P/FCF. Post-filter paths
         also set fetch_limit and post_filter_incomplete.
@@ -1206,6 +1214,7 @@ async def stock_screener(
             primary_only,
             market_cap_usd_min,
             market_cap_usd_max,
+            gross_margin_fq_min,
         )
     except ValueError as e:
         return make_error(ErrorCode.INVALID_PARAMETER, str(e))

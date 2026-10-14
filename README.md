@@ -450,8 +450,9 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 | `market_cap_usd_min` / `market_cap_usd_max` | computed `market_cap_usd` | Post-filter; america/germany/canada = raw; else `FX_IDC:{CCY}USD` |
 | `revenue_growth_yoy_min` | `total_revenue_yoy_growth_ttm` | Percent (15 = +15% YoY TTM) |
 | `revenue_growth_yoy_fq_min` | `total_revenue_yoy_growth_fq` | Latest quarter YoY % |
-| `gross_margin_min` | `gross_margin_ttm` | Percent |
-| `rule_of_40_min` | `rule_of_40_fq` | FQ YoY + TTM FCF margin; post-filter on over-fetch window |
+| `gross_margin_min` | `gross_margin_ttm` | Percent; TV COGS may include D&A (≠ issuer GP) |
+| `gross_margin_fq_min` | computed `gross_margin_fq` | `gross_profit_fq / total_revenue_fq` (scanner field empty); post-filter |
+| `rule_of_40_min` | `rule_of_40_fq` | FQ YoY + TTM FCF margin; post-filter with offset paging |
 | `fcf_positive` / `fcf_min` | `free_cash_flow_ttm` | Absolute; `fcf_min` wins if both set |
 | `net_debt_to_ebitda_max` | `net_debt_to_ebitda_fq` | Exclude banks/insurers via `sector_exclude` |
 | `sector_exclude` | `sector` | e.g. `["Finance"]` |
@@ -463,7 +464,8 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 - There is **no** dedicated `number_of_analysts` field; `recommendation_total` (buy+hold+sell+over+under) is the closest proxy exposed as `analyst_count`.
 - There is **no** standalone FCF-yield field; when fundamentals are requested the response includes `price_free_cash_flow_ttm` (P/FCF) instead.
 - There is **no** previous-quarter revenue YoY on the scanner — only latest FQ YoY.
-- `rule_of_40_min` / `market_cap_usd_*` / `sort_by=rule_of_40` run on an over-fetched window (`limit×5`); `post_filter_incomplete=true` means `tv_total_matches > fetch_limit` (passers may exist outside the window).
+- TV `gross_margin_*` uses TV Gross profit / COGS (often includes D&A that issuers report below GP — e.g. PAYS); CGNT/MNDY usually match company figures.
+- `rule_of_40_min` / `market_cap_usd_*` / `gross_margin_fq_min` / `sort_by=rule_of_40|gross_margin_fq` over-fetch pages (`limit×5`, max 3 pages with offset); `post_filter_incomplete=true` means unscanned TV where-rows remain. On that path `total_matches` is the passer count only when fully scanned, else `null` (`tv_total_matches` = TV raw where count).
 - This tool calls TradingView's **undocumented** scanner endpoint (`https://scanner.tradingview.com/<market>/scan`). Field names, operators, or access can change or be rate-limited without notice — treat as a known breakage point for automation.
 
 ---
