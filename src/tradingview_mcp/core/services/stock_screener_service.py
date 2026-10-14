@@ -52,6 +52,18 @@ EXAMPLE_MARKETS = (
 # Dual-list checks (2026-10-13): market_cap_basic already USD-scale.
 _USD_NORMALIZED_MARKETS = frozenset({"america", "germany", "canada"})
 
+# Price quote subunits → major currency for market_cap_basic FX.
+# Cap is in the major unit (e.g. LSE AAF: currency=GBX but market_cap_basic in GBP).
+# Do NOT divide the cap by 100 — only switch the FX pair (GBPUSD not GBXUSD).
+_PRICE_SUBUNIT_TO_MAJOR: dict[str, str] = {
+    "GBX": "GBP",
+    "GBP": "GBP",  # already major; kept for normalize idempotence
+    "GBp": "GBP",
+    "ZAC": "ZAR",
+    "ZAc": "ZAR",
+    "ILA": "ILS",
+}
+
 _SCREEN_COLUMNS = (
     "name", "description", "exchange", "open", "high", "low", "close",
     "currency", "change", "dividends_yield_current", "market_cap_basic",
@@ -76,6 +88,7 @@ _EXTENDED_FUNDAMENTAL_COLUMNS = (
     "gross_margin_ttm",
     "gross_margin_fq",  # scanner field exists but is typically empty — see compute
     "gross_profit_fq",
+    "fundamental_currency_code",
     "industry",
     "is_primary",
 )
@@ -148,15 +161,21 @@ _EXTENDED_API_LIMITATIONS = (
     "margin (FCF remains TTM on the fq arm).",
     "market_cap (market_cap_basic) unit is market-dependent: america/"
     "germany/canada treated as USD-scale (market_cap_usd_* also pushed into "
-    "TV where there); other markets convert via FX_IDC:{CCY}USD into "
-    "market_cap_usd and filter client-side only. Raw market_cap_min/max "
-    "always filter market_cap_basic.",
-    "Post-filters (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min) "
-    "and computed sorts (rule_of_40, gross_margin_fq) page through the TV "
-    f"where-set (page size {_POST_FILTER_PAGE_SIZE}, default max_scan_rows="
-    f"{_DEFAULT_MAX_SCAN_ROWS}) in market_cap order, then filter/sort "
-    "client-side. total_matches is the passer count among scanned rows. "
-    "post_filter_incomplete=true (+ warning) when tv_total_matches > "
+    "TV where there); other markets convert via FX_IDC:{MAJOR}USD. Cap FX "
+    "uses the listing major currency (price subunits normalized: GBX/GBp→GBP, "
+    "ZAc→ZAR, ILA→ILS) — never GBXUSD on an LSE pound-denominated cap. "
+    "Raw market_cap_min/max always filter market_cap_basic.",
+    "total_revenue_ttm / free_cash_flow_ttm are in fundamental_currency_code "
+    "(often USD even on LSE/OMX). fcf_margin_ttm and TV price_free_cash_flow_ttm "
+    "are same-currency ratios (OK). market_cap_usd may use listing GBP while "
+    "revenue is USD — do not mix them into a DIY P/FCF; use TV's P/FCF or "
+    "convert both legs. total_revenue_min filters computed total_revenue_usd.",
+    "Post-filters (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min, "
+    "total_revenue_min) and computed sorts (rule_of_40, gross_margin_fq) page "
+    f"the TV where-set (page size {_POST_FILTER_PAGE_SIZE}, default "
+    f"max_scan_rows={_DEFAULT_MAX_SCAN_ROWS}) in market_cap order, then "
+    "filter/sort client-side. total_matches is the passer count among scanned "
+    "rows. post_filter_incomplete=true (+ warning) when tv_total_matches > "
     "max_scan_rows — ranking covers only the first N market_cap rows. "
     "Native-column sorts (market_cap, revenue_growth, gross_margin, …) "
     "remain a single TV-side request.",
@@ -178,6 +197,8 @@ _EXTENDED_FUND_AUDIT_KEYS = _LEGACY_FUND_AUDIT_KEYS + (
     "market_cap_usd",
     "revenue_growth_yoy_fq",
     "total_revenue_ttm",
+    "total_revenue_usd",
+    "fundamental_currency",
     "gross_margin_ttm",
     "gross_margin_fq",
     "fcf_margin_ttm",
@@ -195,6 +216,8 @@ _NEW_RESPONSE_KEYS = frozenset({
     "market_cap_usd",
     "revenue_growth_yoy_fq",
     "total_revenue_ttm",
+    "total_revenue_usd",
+    "fundamental_currency",
     "gross_margin_ttm",
     "gross_margin_fq",
     "fcf_margin_ttm",
@@ -273,6 +296,7 @@ def _any_new_fundamental_filter(
     market_cap_usd_min: Optional[float],
     market_cap_usd_max: Optional[float],
     gross_margin_fq_min: Optional[float] = None,
+    total_revenue_min: Optional[float] = None,
 ) -> bool:
     return any(
         v is not None
@@ -283,6 +307,7 @@ def _any_new_fundamental_filter(
             market_cap_usd_min,
             market_cap_usd_max,
             gross_margin_fq_min,
+            total_revenue_min,
         )
     ) or bool(primary_only)
 
@@ -303,6 +328,7 @@ def _any_fundamental_filter(
     market_cap_usd_min: Optional[float] = None,
     market_cap_usd_max: Optional[float] = None,
     gross_margin_fq_min: Optional[float] = None,
+    total_revenue_min: Optional[float] = None,
 ) -> bool:
     return _any_legacy_fundamental_filter(
         market_cap_min,
@@ -321,6 +347,7 @@ def _any_fundamental_filter(
         market_cap_usd_min,
         market_cap_usd_max,
         gross_margin_fq_min,
+        total_revenue_min,
     )
 
 
@@ -330,12 +357,14 @@ def _needs_post_filter(
     market_cap_usd_max: Optional[float],
     computed_sort: bool,
     gross_margin_fq_min: Optional[float] = None,
+    total_revenue_min: Optional[float] = None,
 ) -> bool:
     return (
         rule_of_40_min is not None
         or market_cap_usd_min is not None
         or market_cap_usd_max is not None
         or gross_margin_fq_min is not None
+        or total_revenue_min is not None
         or computed_sort
     )
 
@@ -446,13 +475,40 @@ def _fx_ccy_from_scanner_row(row: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _normalize_listing_currency(currency: Any) -> Optional[str]:
+    """Map price-quote currency to the major unit used by market_cap_basic.
+
+    GBX/GBp → GBP, ZAc → ZAR, ILA → ILS. Cap values are NOT scaled (/100);
+    only the FX pair changes.
+    """
+    if currency is None:
+        return None
+    raw = str(currency).strip()
+    if not raw:
+        return None
+    # Preserve canonical major codes via the map (case variants for subunits).
+    if raw in _PRICE_SUBUNIT_TO_MAJOR:
+        return _PRICE_SUBUNIT_TO_MAJOR[raw]
+    upper = raw.upper()
+    if upper in _PRICE_SUBUNIT_TO_MAJOR:
+        return _PRICE_SUBUNIT_TO_MAJOR[upper]
+    return upper
+
+
+def _normalize_fund_currency(currency: Any) -> Optional[str]:
+    """Normalize fundamental_currency_code (same subunit map as listing)."""
+    return _normalize_listing_currency(currency)
+
+
 def _fetch_fx_to_usd(currencies: Sequence[str]) -> dict[str, Optional[float]]:
     """Batch-fetch FX_IDC:{CCY}USD close rates. Missing → None (no crash)."""
     rates: dict[str, Optional[float]] = {"USD": 1.0}
     needed = sorted({
-        str(c).strip().upper()
-        for c in currencies
-        if c and str(c).strip().upper() not in ("", "USD")
+        maj
+        for maj in (
+            _normalize_listing_currency(c) for c in currencies
+        )
+        if maj and maj not in ("", "USD")
     })
     if not needed:
         return rates
@@ -483,13 +539,42 @@ def _fetch_fx_to_usd(currencies: Sequence[str]) -> dict[str, Optional[float]]:
     return rates
 
 
+def _amount_to_usd(
+    amount: Any,
+    currency: Any,
+    fx_rates: dict[str, Optional[float]],
+) -> tuple[Optional[float], Optional[str]]:
+    """Convert an absolute amount to USD using a (possibly subunit) currency."""
+    if amount is None:
+        return None, None
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        return None, None
+    ccy = _normalize_listing_currency(currency)
+    if not ccy:
+        return None, "currency missing; usd=null"
+    if ccy == "USD":
+        return val, None
+    rate = fx_rates.get(ccy)
+    if rate is None:
+        return None, f"FX rate unavailable for {ccy}USD; usd=null"
+    try:
+        return val * float(rate), None
+    except (TypeError, ValueError):
+        return None, f"FX rate invalid for {ccy}USD; usd=null"
+
+
 def _compute_market_cap_usd(
     market_cap: Any,
     currency: Any,
     country: str,
     fx_rates: dict[str, Optional[float]],
 ) -> tuple[Optional[float], Optional[str]]:
-    """Return (market_cap_usd, limitation_note_or_None)."""
+    """Return (market_cap_usd, limitation_note_or_None).
+
+    Uses listing major currency (GBX→GBP), not fundamental_currency_code.
+    """
     if market_cap is None:
         return None, None
     try:
@@ -500,19 +585,7 @@ def _compute_market_cap_usd(
     if country in _USD_NORMALIZED_MARKETS:
         return cap, None
 
-    ccy = str(currency).strip().upper() if currency else ""
-    if not ccy:
-        return None, "currency missing; market_cap_usd=null"
-    if ccy == "USD":
-        return cap, None
-
-    rate = fx_rates.get(ccy)
-    if rate is None:
-        return None, f"FX rate unavailable for {ccy}USD; market_cap_usd=null"
-    try:
-        return cap * float(rate), None
-    except (TypeError, ValueError):
-        return None, f"FX rate invalid for {ccy}USD; market_cap_usd=null"
+    return _amount_to_usd(cap, currency, fx_rates)
 
 
 def _safe_div_pct(num: Any, den: Any) -> Optional[float]:
@@ -559,21 +632,24 @@ def screen_stocks(
     market_cap_usd_max: Optional[float] = None,
     gross_margin_fq_min: Optional[float] = None,
     max_scan_rows: Optional[int] = None,
+    total_revenue_min: Optional[float] = None,
 ) -> dict[str, Any]:
     """Screen stocks of one share type for a country market.
 
     Returns an envelope: total_matches is the TV where count on native-sort
     paths; on post-filter / computed-sort paths it is the passer count among
     scanned rows. Rows are the top-N by sort_by. Post-filters
-    (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min) and computed
-    sorts page the full TV where-set (page size 1000, up to max_scan_rows)
-    in market_cap order, then compute → filter → re-sort → truncate.
-    Native-column sorts stay a single TV request of size ``limit``.
+    (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min, total_revenue_min)
+    and computed sorts page the full TV where-set (page size 1000, up to
+    max_scan_rows) in market_cap order, then compute → filter → re-sort →
+    truncate. Native-column sorts stay a single TV request of size ``limit``.
 
     Optional fundamental filters are AND-combined. Units (verified live):
       - market_cap_min/max : raw market_cap_basic (NOT always USD — see
         market_cap_usd / API_LIMITATIONS)
-      - market_cap_usd_min/max : computed USD cap (post-filter)
+      - market_cap_usd_min/max : computed USD cap (post-filter; listing
+        major currency — GBX→GBP FX, no /100 on the cap)
+      - total_revenue_min : min total_revenue_usd (fundamental currency → USD)
       - revenue_growth_yoy_min : percent TTM (15 = +15% YoY TTM)
       - revenue_growth_yoy_fq_min : percent latest quarter YoY
       - gross_margin_min : gross_margin_ttm percent (TV COGS definition —
@@ -655,6 +731,7 @@ def screen_stocks(
         market_cap_usd_min,
         market_cap_usd_max,
         gross_margin_fq_min,
+        total_revenue_min,
     )
     # Extended payload iff any NEW filter or NEW sort key (incl. rule_of_40).
     extended_payload = new_filters or sort_key in _NEW_SORT_KEYS
@@ -674,6 +751,7 @@ def screen_stocks(
         market_cap_usd_max,
         computed_sort=computed_sort_col is not None,
         gross_margin_fq_min=gross_margin_fq_min,
+        total_revenue_min=total_revenue_min,
     )
 
     if market_cap_min is not None and market_cap_max is not None:
@@ -807,6 +885,8 @@ def screen_stocks(
         applied_filters["market_cap_usd_min"] = float(market_cap_usd_min)
     if market_cap_usd_max is not None:
         applied_filters["market_cap_usd_max"] = float(market_cap_usd_max)
+    if total_revenue_min is not None:
+        applied_filters["total_revenue_min"] = float(total_revenue_min)
     if primary_only:
         applied_filters["primary_only"] = True
     if fcf_min is not None:
@@ -847,9 +927,13 @@ def screen_stocks(
             revenue_ttm = _clean(r.get("total_revenue_ttm"))
             fcf = _clean(r.get("free_cash_flow_ttm"))
             fcf_margin = _safe_div_pct(fcf, revenue_ttm)
+            fund_ccy = _normalize_fund_currency(
+                _clean(r.get("fundamental_currency_code"))
+            )
             row["revenue_growth_yoy_ttm"] = rev_ttm
             row["revenue_growth_yoy_fq"] = rev_fq
             row["total_revenue_ttm"] = revenue_ttm
+            row["fundamental_currency"] = fund_ccy
             row["gross_margin_ttm"] = _clean(r.get("gross_margin_ttm"))
             row["gross_margin_fq"] = _resolve_gross_margin_fq(r)
             row["free_cash_flow_ttm"] = fcf
@@ -864,12 +948,17 @@ def screen_stocks(
             row["industry"] = _clean(r.get("industry"))
             row["is_primary"] = _clean(r.get("is_primary"))
             row["analyst_count"] = _clean(r.get("recommendation_total"))
+            # Cap FX: listing major (GBX→GBP). Fund FX: fundamental_currency.
             mcap_usd, note = _compute_market_cap_usd(
                 market_cap, currency, country, fx_rates
             )
             row["market_cap_usd"] = mcap_usd
             if note and note not in fx_notes:
                 fx_notes.append(note)
+            rev_usd, rev_note = _amount_to_usd(revenue_ttm, fund_ccy, fx_rates)
+            row["total_revenue_usd"] = rev_usd
+            if rev_note and rev_note not in fx_notes:
+                fx_notes.append(rev_note)
         elif legacy_payload:
             # Pre-101 audit keys only — no new response fields.
             row["revenue_growth_yoy_ttm"] = _clean(
@@ -900,6 +989,10 @@ def screen_stocks(
         if gross_margin_fq_min is not None:
             gm_fq = row.get("gross_margin_fq")
             if gm_fq is None or float(gm_fq) < float(gross_margin_fq_min):
+                return False
+        if total_revenue_min is not None:
+            rev_usd = row.get("total_revenue_usd")
+            if rev_usd is None or float(rev_usd) < float(total_revenue_min):
                 return False
         return True
 
@@ -936,21 +1029,18 @@ def screen_stocks(
         if not raw_records:
             break
 
-        if extended_payload and page_idx == 0:
-            currencies = [_clean(r.get("currency")) for r in raw_records]
-            need_fx = country not in _USD_NORMALIZED_MARKETS and any(
-                c and str(c).upper() != "USD" for c in currencies
-            )
-            if need_fx:
-                fx_rates = _fetch_fx_to_usd(
-                    [str(c) for c in currencies if c is not None]
-                )
-        elif extended_payload and country not in _USD_NORMALIZED_MARKETS:
-            page_ccys = [
-                str(c)
-                for c in (_clean(r.get("currency")) for r in raw_records)
-                if c and str(c).upper() != "USD" and str(c).upper() not in fx_rates
-            ]
+        if extended_payload:
+            # Listing majors (cap) + fundamental currencies (revenue USD).
+            page_ccys: list[str] = []
+            for r in raw_records:
+                for raw_ccy in (
+                    _clean(r.get("currency")),
+                    _clean(r.get("fundamental_currency_code")),
+                ):
+                    maj = _normalize_listing_currency(raw_ccy)
+                    if maj and maj != "USD" and maj not in fx_rates and maj not in page_ccys:
+                        page_ccys.append(maj)
+            # Cap listing majors + fund currencies (revenue may be USD on LSE).
             if page_ccys:
                 more = _fetch_fx_to_usd(page_ccys)
                 fx_rates.update(more)

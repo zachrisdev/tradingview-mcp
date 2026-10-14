@@ -447,7 +447,8 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 | Param | Scanner / computed field | Notes |
 |------|---------------|-------|
 | `market_cap_min` / `market_cap_max` | `market_cap_basic` | Raw — **not always USD** (e.g. sweden = SEK) |
-| `market_cap_usd_min` / `market_cap_usd_max` | computed `market_cap_usd` | Post-filter; america/germany/canada = raw; else `FX_IDC:{CCY}USD` |
+| `market_cap_usd_min` / `market_cap_usd_max` | computed `market_cap_usd` | Post-filter; america/germany/canada = raw; else FX via listing **major** (GBX→GBP, not GBXUSD) |
+| `total_revenue_min` | computed `total_revenue_usd` | Absolute USD floor (fundamental_currency → USD); post-filter |
 | `revenue_growth_yoy_min` | `total_revenue_yoy_growth_ttm` | Percent (15 = +15% YoY TTM) |
 | `revenue_growth_yoy_fq_min` | `total_revenue_yoy_growth_fq` | Latest quarter YoY % |
 | `gross_margin_min` | `gross_margin_ttm` | Percent; TV COGS may include D&A (≠ issuer GP) |

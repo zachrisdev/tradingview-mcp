@@ -1127,6 +1127,7 @@ async def stock_screener(
     market_cap_usd_max: float | None = None,
     gross_margin_fq_min: float | None = None,
     max_scan_rows: int | None = None,
+    total_revenue_min: float | None = None,
 ) -> dict:
     """Screen stocks by share type — the API twin of TradingView's
     "Common stock" / "Preferred stock" symbol-search filter.
@@ -1153,7 +1154,10 @@ async def stock_screener(
         market_cap_min / market_cap_max: raw market_cap_basic (NOT always USD —
             sweden etc. are local; use market_cap_usd_* for USD caps)
         market_cap_usd_min / market_cap_usd_max: computed USD cap post-filter
-            (america/germany/canada = raw; else FX_IDC:{CCY}USD)
+            (america/germany/canada = raw; else FX via listing major currency —
+            GBX/GBp→GBP, ZAc→ZAR, ILA→ILS; cap is NOT /100)
+        total_revenue_min: min total_revenue_usd (fundamental_currency → USD);
+            post-filter — use to drop low-base Ro40 artefacts
         revenue_growth_yoy_min: min total_revenue_yoy_growth_ttm in percent
             (15 means +15% YoY TTM)
         revenue_growth_yoy_fq_min: min latest-quarter revenue YoY percent
@@ -1174,7 +1178,8 @@ async def stock_screener(
             API LIMITATION: no number_of_analysts field — this is the closest
             proxy. No standalone FCF-yield; price_free_cash_flow_ttm (P/FCF)
             is returned instead. No previous-quarter revenue YoY on scanner.
-            TV gross_margin_* uses TV COGS (may include D&A).
+            TV gross_margin_* uses TV COGS (may include D&A). Cap FX uses
+            listing major currency; revenue/FCF use fundamental_currency_code.
         primary_only: if True, require is_primary (common only — preferred raises)
         max_scan_rows: hard cap for post-filter / computed-sort paging
             (default 5000, max 10000). If TV where > max_scan_rows, envelope
@@ -1221,6 +1226,7 @@ async def stock_screener(
             market_cap_usd_max,
             gross_margin_fq_min,
             max_scan_rows,
+            total_revenue_min,
         )
     except ValueError as e:
         return make_error(ErrorCode.INVALID_PARAMETER, str(e))

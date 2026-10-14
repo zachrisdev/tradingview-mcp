@@ -4,10 +4,12 @@ from tradingview_mcp.core.services.stock_screener_service import (
     _LEGACY_FUND_SORT_KEYS,
     _NEW_RESPONSE_KEYS,
     _NEW_SORT_KEYS,
+    _amount_to_usd,
     _any_legacy_fundamental_filter,
     _any_new_fundamental_filter,
     _compute_market_cap_usd,
     _fx_ccy_from_scanner_row,
+    _normalize_listing_currency,
     _post_filter_incomplete,
     _resolve_gross_margin_fq,
     _safe_div_pct,
@@ -78,6 +80,35 @@ def test_compute_market_cap_usd_fx_missing():
     usd, note = _compute_market_cap_usd(1e12, "SEK", "sweden", {"SEK": None})
     assert usd is None
     assert note is not None and "unavailable" in note
+
+
+def test_normalize_listing_currency_subunits():
+    assert _normalize_listing_currency("GBX") == "GBP"
+    assert _normalize_listing_currency("GBp") == "GBP"
+    assert _normalize_listing_currency("ZAc") == "ZAR"
+    assert _normalize_listing_currency("ILA") == "ILS"
+    assert _normalize_listing_currency("SEK") == "SEK"
+    assert _normalize_listing_currency("NOK") == "NOK"
+    assert _normalize_listing_currency(None) is None
+
+
+def test_compute_market_cap_usd_gbx_uses_gbp_fx_not_penny():
+    """LSE price is GBX but market_cap_basic is in GBP — use GBPUSD, no /100."""
+    rates = {"GBP": 1.32, "GBX": 0.0132}
+    usd, note = _compute_market_cap_usd(10.4e9, "GBX", "uk", rates)
+    assert note is None
+    assert usd is not None
+    assert abs(usd - 10.4e9 * 1.32) < 1.0
+    # Must NOT be the penny-FX result (~100x too small).
+    assert usd > 1e9
+
+
+def test_amount_to_usd_fund_currency():
+    usd, note = _amount_to_usd(6.77e9, "USD", {})
+    assert usd == 6.77e9 and note is None
+    usd2, note2 = _amount_to_usd(297e6, "GBP", {"GBP": 1.32})
+    assert note2 is None and usd2 is not None
+    assert abs(usd2 - 297e6 * 1.32) < 1.0
 
 
 def test_fx_ccy_from_scanner_row_variants():
