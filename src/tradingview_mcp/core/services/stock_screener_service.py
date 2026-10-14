@@ -774,9 +774,13 @@ def screen_stocks(
     if sort_col is not None and sort_col not in select_cols:
         select_cols.append(sort_col)
 
-    # TV order_by: computed sorts fall back to market_cap while paging the
-    # where-set; client re-sorts after compute/post-filter.
-    tv_order_col = sort_col if sort_col is not None else "market_cap_basic"
+    # TV order_by: post-filter / computed-sort paths always page the where-set
+    # by market_cap_basic (docs/warning assume cap-ordered truncation). Native
+    # single-request sorts use the requested TV column.
+    if needs_post:
+        tv_order_col = "market_cap_basic"
+    else:
+        tv_order_col = sort_col if sort_col is not None else "market_cap_basic"
     if tv_order_col not in select_cols:
         select_cols.append(tv_order_col)
 
