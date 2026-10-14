@@ -363,6 +363,71 @@ def _resolve_gross_margin_fq(row: dict[str, Any]) -> Optional[float]:
     )
 
 
+def _tv_range_bounds(start: int, page_size: int) -> tuple[int, int]:
+    """TradingView scanner ``range`` is ``[start, end)``, not ``[offset, count]``.
+
+    tradingview-screener's ``.offset(a).limit(b)`` writes ``range=[a, b]``, so
+    for a page of ``page_size`` rows starting at ``start`` callers must pass
+    ``limit=start+page_size`` (end), not ``limit=page_size``.
+    """
+    start_i = max(0, int(start))
+    size_i = max(0, int(page_size))
+    return start_i, start_i + size_i
+
+
+def _fetch_stock_scanner_page(
+    country: str,
+    select_cols: Sequence[str],
+    filters: Sequence[Any],
+    order_col: str,
+    start: int,
+    page_size: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    """One scanner page. Empty/null ``data`` or invalid range → ``(total, [])``."""
+    _require_available()
+    start_i, end_i = _tv_range_bounds(start, page_size)
+    if end_i <= start_i:
+        return 0, []
+
+    query = (
+        Query()
+        .set_markets(country)
+        .select(*select_cols)
+        .where(*filters)
+        .order_by(order_col, ascending=False)
+        # range = [start, end) — see _tv_range_bounds
+        .offset(start_i)
+        .limit(end_i)
+    )
+    try:
+        payload = query.get_scanner_data_raw(timeout=20)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "invalid range" in msg or "not iterable" in msg:
+            return 0, []
+        raise
+
+    try:
+        total = int(payload.get("totalCount") or 0)
+    except (TypeError, ValueError, AttributeError):
+        total = 0
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not data:
+        # TV returns data:null past the end / on empty windows — exhausted page.
+        return total, []
+
+    columns = ["ticker", *list(select_cols)]
+    records: list[dict[str, Any]] = []
+    for row in data:
+        values = [row.get("s"), *(row.get("d") or [])]
+        rec = {
+            columns[i]: (values[i] if i < len(values) else None)
+            for i in range(len(columns))
+        }
+        records.append(rec)
+    return total, records
+
+
 def _fx_ccy_from_scanner_row(row: dict[str, Any]) -> Optional[str]:
     """Extract quote currency from an FX_IDC:{CCY}USD scanner row."""
     ticker = str(row.get("ticker") or "").upper()
@@ -832,19 +897,16 @@ def screen_stocks(
     passers: list[dict[str, Any]] = []
 
     for _page in range(max_pages):
-        query = (
-            Query()
-            .set_markets(country)
-            .select(*select_cols)
-            .where(*filters)
-            .order_by(tv_order_col, ascending=False)
-            .offset(offset)
-            .limit(fetch_limit)
+        # TV range is [start, end); never pass limit=page_size with nonzero
+        # offset (that yields [N, N] → data:null / TypeError in the lib).
+        total, raw_records = _fetch_stock_scanner_page(
+            country,
+            select_cols,
+            filters,
+            tv_order_col,
+            offset,
+            fetch_limit,
         )
-        # get_scanner_data forwards kwargs to requests.post, which has no
-        # default timeout — a stalled endpoint would hang forever.
-        total, df = query.get_scanner_data(timeout=20)
-        raw_records = df.to_dict("records")
         if not raw_records:
             break
 

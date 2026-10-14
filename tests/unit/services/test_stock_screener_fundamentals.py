@@ -12,6 +12,7 @@ from tradingview_mcp.core.services.stock_screener_service import (
     _resolve_gross_margin_fq,
     _safe_div_pct,
     _safe_sum,
+    _tv_range_bounds,
 )
 
 
@@ -100,3 +101,11 @@ def test_resolve_gross_margin_fq_prefers_direct_then_ratio():
         {"gross_margin_fq": None, "gross_profit_fq": 15557194, "total_revenue_fq": 28252071}
     ) == _safe_div_pct(15557194, 28252071)
     assert _resolve_gross_margin_fq({"gross_profit_fq": 10, "total_revenue_fq": None}) is None
+
+
+def test_tv_range_bounds_is_start_end_not_offset_count():
+    # Regression: .offset(15).limit(15) → range [15,15] → data:null crash.
+    assert _tv_range_bounds(0, 15) == (0, 15)
+    assert _tv_range_bounds(15, 15) == (15, 30)
+    assert _tv_range_bounds(30, 15) == (30, 45)
+    assert _tv_range_bounds(0, 0) == (0, 0)
