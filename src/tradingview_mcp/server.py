@@ -1119,6 +1119,12 @@ async def stock_screener(
     net_debt_to_ebitda_max: float | None = None,
     sector_exclude: list[str] | str | None = None,
     analyst_count_max: float | None = None,
+    gross_margin_min: float | None = None,
+    revenue_growth_yoy_fq_min: float | None = None,
+    rule_of_40_min: float | None = None,
+    primary_only: bool = False,
+    market_cap_usd_min: float | None = None,
+    market_cap_usd_max: float | None = None,
 ) -> dict:
     """Screen stocks by share type — the API twin of TradingView's
     "Common stock" / "Preferred stock" symbol-search filter.
@@ -1128,45 +1134,52 @@ async def stock_screener(
 
     Args:
         country: TradingView market name — e.g. america, korea, germany,
-            brazil, japan, uk, india, turkey, canada, australia, france, hongkong
+            brazil, japan, uk, india, turkey, canada, australia, france,
+            hongkong, sweden
         stock_type: common | preferred
-        limit: rows to return (max 2000, single upstream request), ranked by sort_by descending
+        limit: rows to return (max 2000), ranked by sort_by descending
         exclude_otc: default True — drop OTC listings (foreign companies traded
             over-the-counter); "america" otherwise means "US venue", not "US company"
         compact: default False — True returns only ticker/symbol/price/currency/
             change_percent per row (light payload for bulk price feeds); when
             fundamental filters are used, those audit columns are kept
         sort_by: market_cap (default) | dividend_yield | change | price |
-            revenue_growth | fcf | net_debt_ebitda — server-side descending sort
-            over the WHOLE filtered set
-        market_cap_min: minimum market cap (USD, market_cap_basic)
-        market_cap_max: maximum market cap (USD)
+            revenue_growth | revenue_growth_fq | gross_margin | fcf |
+            net_debt_ebitda | rule_of_40. TV-column sorts are server-side over
+            the TV where set; rule_of_40 is client post-sort on an over-fetched
+            window (not a full-market guarantee)
+        market_cap_min / market_cap_max: raw market_cap_basic (NOT always USD —
+            sweden etc. are local; use market_cap_usd_* for USD caps)
+        market_cap_usd_min / market_cap_usd_max: computed USD cap post-filter
+            (america/germany/canada = raw; else FX_IDC:{CCY}USD)
         revenue_growth_yoy_min: min total_revenue_yoy_growth_ttm in percent
             (15 means +15% YoY TTM)
+        revenue_growth_yoy_fq_min: min latest-quarter revenue YoY percent
+        gross_margin_min: min gross_margin_ttm percent
+        rule_of_40_min: min rule_of_40_fq (= FQ YoY + TTM FCF margin); post-filter
         fcf_positive: if True, require free_cash_flow_ttm > 0; if False, <= 0.
             Ignored when fcf_min is set (fcf_min is the stricter floor)
-        fcf_min: minimum free_cash_flow_ttm in USD
+        fcf_min: minimum free_cash_flow_ttm (absolute)
         net_debt_to_ebitda_max: max net_debt_to_ebitda_fq (misleading for banks/
             insurers — exclude Finance via sector_exclude)
         sector_exclude: TradingView sector names to drop, e.g. ["Finance"]
-            (valid names include Finance, Electronic Technology, Health Services, …)
         analyst_count_max: max recommendation_total (buy+hold+sell+over+under).
-            API LIMITATION: there is NO number_of_analysts field — this is the
-            closest proxy. There is also NO standalone FCF-yield field; when
-            fundamentals are requested, price_free_cash_flow_ttm (P/FCF) is
-            returned instead.
+            API LIMITATION: no number_of_analysts field — this is the closest
+            proxy. No standalone FCF-yield; price_free_cash_flow_ttm (P/FCF)
+            is returned instead. No previous-quarter revenue YoY on scanner.
+        primary_only: if True, require is_primary (common only — preferred raises)
 
     Fragility: uses TradingView's undocumented scanner API
     (scanner.tradingview.com/<market>/scan). Field names/operators can change
     or be rate-limited without notice.
 
     Returns:
-        Envelope dict: total_matches, returned, filters_applied, rows of
-        {ticker, symbol, description, exchange, price, open, high, low,
-        currency, change_percent, dividend_yield, market_cap} plus — when any
-        fundamental filter is set — revenue_growth_yoy_ttm, free_cash_flow_ttm,
-        price_free_cash_flow_ttm, net_debt_to_ebitda_fq, sector, analyst_count.
-        Prices are in the market's local currency (e.g. KRW for korea).
+        Envelope: total_matches / tv_total_matches, returned, filters_applied,
+        rows with base price fields plus — when any fundamental filter is set —
+        revenue_growth_yoy_ttm/fq, total_revenue_ttm, gross_margin_ttm,
+        free_cash_flow_ttm, fcf_margin_ttm, rule_of_40_ttm/fq, market_cap_usd,
+        industry, is_primary, sector, analyst_count, P/FCF. Post-filter paths
+        also set fetch_limit and post_filter_incomplete.
     """
     try:
         # tradingview-screener is sync (urllib) — off-load to a worker thread
@@ -1187,6 +1200,12 @@ async def stock_screener(
             net_debt_to_ebitda_max,
             sector_exclude,
             analyst_count_max,
+            gross_margin_min,
+            revenue_growth_yoy_fq_min,
+            rule_of_40_min,
+            primary_only,
+            market_cap_usd_min,
+            market_cap_usd_max,
         )
     except ValueError as e:
         return make_error(ErrorCode.INVALID_PARAMETER, str(e))

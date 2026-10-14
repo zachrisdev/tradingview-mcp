@@ -16,16 +16,13 @@ returns 0 rows (america preferred: 676 without the filter, 0 with it). See
 also futures_service._futures_query() for why bumping tradingview-screener
 past 3.0.0 would inject exactly that kind of preset by default.
 
-Fundamental filters (optional, AND-combined) were verified against the live
-scanner metainfo + america/scan (2026-09-09):
-  - market_cap_basic
-  - total_revenue_yoy_growth_ttm  (percent, e.g. 15 = +15% YoY TTM)
-  - free_cash_flow_ttm            (USD absolute)
-  - net_debt_to_ebitda_fq
-  - sector                        (text enum; "Finance" exists)
-  - recommendation_total          (sum of buy/hold/sell/over/under — proxy
-                                  for analyst coverage count; there is NO
-                                  dedicated number_of_analysts field)
+Fundamental filters (optional, AND-combined) verified live 2026-09-09 /
+extended 2026-10-13:
+  - market_cap_basic (raw; unit is market-dependent — see market_cap_usd)
+  - total_revenue_yoy_growth_ttm / total_revenue_yoy_growth_fq
+  - gross_margin_ttm, total_revenue_ttm, free_cash_flow_ttm
+  - net_debt_to_ebitda_fq, sector, industry, is_primary
+  - recommendation_total (analyst-coverage proxy)
 
 Fragility: this hits TradingView's undocumented scanner API
 (https://scanner.tradingview.com/<market>/scan). Field names and operators
@@ -49,16 +46,20 @@ STOCK_TYPES = ("common", "preferred")
 EXAMPLE_MARKETS = (
     "america", "korea", "germany", "brazil", "japan", "uk",
     "india", "turkey", "canada", "australia", "france", "hongkong",
+    "sweden",
 )
+
+# Dual-list checks (2026-10-13): market_cap_basic already USD-scale.
+_USD_NORMALIZED_MARKETS = frozenset({"america", "germany", "canada"})
 
 _SCREEN_COLUMNS = (
     "name", "description", "exchange", "open", "high", "low", "close",
     "currency", "change", "dividends_yield_current", "market_cap_basic",
 )
 
-# Extra columns pulled when any fundamental filter is active (so results can
-# be audited against the criteria that produced them).
-_FUNDAMENTAL_COLUMNS = (
+# Pre-101 (legacy) scanner columns / response audit keys — keep byte-stable
+# when only legacy filters or legacy fund sort_by are used.
+_LEGACY_FUNDAMENTAL_COLUMNS = (
     "total_revenue_yoy_growth_ttm",
     "free_cash_flow_ttm",
     "price_free_cash_flow_ttm",
@@ -67,26 +68,50 @@ _FUNDAMENTAL_COLUMNS = (
     "recommendation_total",
 )
 
+# TODO-Dev 101 extras — only when any *new* filter or *new* sort key is used.
+_EXTENDED_FUNDAMENTAL_COLUMNS = (
+    "total_revenue_yoy_growth_fq",
+    "total_revenue_ttm",
+    "gross_margin_ttm",
+    "industry",
+    "is_primary",
+)
+
+_FUNDAMENTAL_COLUMNS = _LEGACY_FUNDAMENTAL_COLUMNS + _EXTENDED_FUNDAMENTAL_COLUMNS
+
 MAX_SCREEN_LIMIT = 2000
 MAX_PRICE_TICKERS = 2000
+# Over-fetch multiplier when post-filters (Ro40 / market_cap_usd) are active
+# so the TV .limit window is not the only search space.
+_POST_FILTER_OVERFETCH_K = 5
 
-# sort_by -> scanner column. Every entry must also be in selected columns.
-# Field-tested motivation: without a server-side sort, "top dividend payers"
-# can only be computed inside the market-cap-ranked window the caller pulled —
-# the real leaders in the long tail stay invisible.
+# sort_by -> scanner column (TV server-side). Computed sorts are handled
+# client-side after over-fetch (see _COMPUTED_SORT_FIELDS).
 SORT_FIELDS = {
     "market_cap": "market_cap_basic",
     "dividend_yield": "dividends_yield_current",
     "change": "change",
     "price": "close",
     "revenue_growth": "total_revenue_yoy_growth_ttm",
+    "revenue_growth_fq": "total_revenue_yoy_growth_fq",
+    "gross_margin": "gross_margin_ttm",
     "fcf": "free_cash_flow_ttm",
     "net_debt_ebitda": "net_debt_to_ebitda_fq",
 }
 
-# Documented API gaps — surfaced in tool docs / envelopes so callers (e.g.
-# incubator-protocol) know what cannot be automated from this endpoint alone.
-API_LIMITATIONS = (
+# Pre-101 fund sort keys (trigger legacy audit payload, not extended).
+_LEGACY_FUND_SORT_KEYS = frozenset({"revenue_growth", "fcf", "net_debt_ebitda"})
+
+# TODO-Dev 101 sort keys (trigger full extended audit payload).
+_NEW_SORT_KEYS = frozenset({"revenue_growth_fq", "gross_margin", "rule_of_40"})
+
+# sort_by values that exist only after client-side compute (post-sort).
+_COMPUTED_SORT_FIELDS = {
+    "rule_of_40": "rule_of_40_fq",
+}
+
+# Documented API gaps — legacy subset is BC-stable for pre-101 fund callers.
+_LEGACY_API_LIMITATIONS = (
     "No dedicated number_of_analysts field; recommendation_total "
     "(buy+hold+sell+over+under) is the closest proxy.",
     "No standalone FCF yield field; price_free_cash_flow_ttm (P/FCF) is "
@@ -94,6 +119,65 @@ API_LIMITATIONS = (
     "Uses TradingView's undocumented scanner API — field names/operators "
     "may change or be rate-limited without notice.",
 )
+
+_EXTENDED_API_LIMITATIONS = (
+    "No previous-quarter revenue YoY on the scanner "
+    "(total_revenue_yoy_growth_fq_1 etc. empty) — only latest FQ YoY.",
+    "rule_of_40_min filters on rule_of_40_fq = FQ revenue YoY + TTM FCF "
+    "margin (FCF remains TTM on the fq arm).",
+    "market_cap (market_cap_basic) unit is market-dependent: america/"
+    "germany/canada treated as USD-scale (market_cap_usd_* also pushed into "
+    "TV where there); other markets convert via FX_IDC:{CCY}USD into "
+    "market_cap_usd and filter client-side only. Raw market_cap_min/max "
+    "always filter market_cap_basic.",
+    "rule_of_40 / market_cap_usd post-filters (and sort_by=rule_of_40) run "
+    "on an over-fetched window (limit×K), not the full TV match set. "
+    "post_filter_incomplete=true means tv_total_matches > fetch_limit "
+    "(passers may exist outside the over-fetch window).",
+)
+
+API_LIMITATIONS = _LEGACY_API_LIMITATIONS + _EXTENDED_API_LIMITATIONS
+
+_LEGACY_FUND_AUDIT_KEYS = (
+    "market_cap",
+    "revenue_growth_yoy_ttm",
+    "free_cash_flow_ttm",
+    "price_free_cash_flow_ttm",
+    "net_debt_to_ebitda_fq",
+    "sector",
+    "analyst_count",
+)
+
+_EXTENDED_FUND_AUDIT_KEYS = _LEGACY_FUND_AUDIT_KEYS + (
+    "market_cap_usd",
+    "revenue_growth_yoy_fq",
+    "total_revenue_ttm",
+    "gross_margin_ttm",
+    "fcf_margin_ttm",
+    "rule_of_40_ttm",
+    "rule_of_40_fq",
+    "industry",
+    "is_primary",
+)
+
+# Alias used by compact keep-list on extended path.
+_FUND_AUDIT_KEYS = _EXTENDED_FUND_AUDIT_KEYS
+
+# New response keys that must NOT appear on the legacy fund path (BC-A / test c).
+_NEW_RESPONSE_KEYS = frozenset({
+    "market_cap_usd",
+    "revenue_growth_yoy_fq",
+    "total_revenue_ttm",
+    "gross_margin_ttm",
+    "fcf_margin_ttm",
+    "rule_of_40_ttm",
+    "rule_of_40_fq",
+    "industry",
+    "is_primary",
+    "tv_total_matches",
+    "fetch_limit",
+    "post_filter_incomplete",
+})
 
 
 def _clean(value: Any) -> Any:
@@ -126,7 +210,7 @@ def _normalize_sector_exclude(sector_exclude: Any) -> list[str]:
     )
 
 
-def _any_fundamental_filter(
+def _any_legacy_fundamental_filter(
     market_cap_min: Optional[float],
     market_cap_max: Optional[float],
     revenue_growth_yoy_min: Optional[float],
@@ -150,6 +234,193 @@ def _any_fundamental_filter(
     ) or bool(sector_exclude)
 
 
+def _any_new_fundamental_filter(
+    gross_margin_min: Optional[float],
+    revenue_growth_yoy_fq_min: Optional[float],
+    rule_of_40_min: Optional[float],
+    primary_only: Optional[bool],
+    market_cap_usd_min: Optional[float],
+    market_cap_usd_max: Optional[float],
+) -> bool:
+    return any(
+        v is not None
+        for v in (
+            gross_margin_min,
+            revenue_growth_yoy_fq_min,
+            rule_of_40_min,
+            market_cap_usd_min,
+            market_cap_usd_max,
+        )
+    ) or bool(primary_only)
+
+
+def _any_fundamental_filter(
+    market_cap_min: Optional[float],
+    market_cap_max: Optional[float],
+    revenue_growth_yoy_min: Optional[float],
+    fcf_positive: Optional[bool],
+    fcf_min: Optional[float],
+    net_debt_to_ebitda_max: Optional[float],
+    sector_exclude: Sequence[str],
+    analyst_count_max: Optional[float],
+    gross_margin_min: Optional[float] = None,
+    revenue_growth_yoy_fq_min: Optional[float] = None,
+    rule_of_40_min: Optional[float] = None,
+    primary_only: Optional[bool] = None,
+    market_cap_usd_min: Optional[float] = None,
+    market_cap_usd_max: Optional[float] = None,
+) -> bool:
+    return _any_legacy_fundamental_filter(
+        market_cap_min,
+        market_cap_max,
+        revenue_growth_yoy_min,
+        fcf_positive,
+        fcf_min,
+        net_debt_to_ebitda_max,
+        sector_exclude,
+        analyst_count_max,
+    ) or _any_new_fundamental_filter(
+        gross_margin_min,
+        revenue_growth_yoy_fq_min,
+        rule_of_40_min,
+        primary_only,
+        market_cap_usd_min,
+        market_cap_usd_max,
+    )
+
+
+def _needs_post_filter(
+    rule_of_40_min: Optional[float],
+    market_cap_usd_min: Optional[float],
+    market_cap_usd_max: Optional[float],
+    computed_sort: bool,
+) -> bool:
+    return (
+        rule_of_40_min is not None
+        or market_cap_usd_min is not None
+        or market_cap_usd_max is not None
+        or computed_sort
+    )
+
+
+def _post_filter_incomplete(tv_total: int, fetch_limit: int) -> bool:
+    """True when the TV where-set is larger than the over-fetch window.
+
+    Meaning: passers of client-side post-filters may exist outside the
+    fetched page. Independent of MAX_SCREEN_LIMIT and of whether the
+    returned page happened to be full.
+    """
+    try:
+        return int(tv_total) > int(fetch_limit)
+    except (TypeError, ValueError):
+        return False
+
+
+def _fx_ccy_from_scanner_row(row: dict[str, Any]) -> Optional[str]:
+    """Extract quote currency from an FX_IDC:{CCY}USD scanner row."""
+    ticker = str(row.get("ticker") or "").upper()
+    name = str(row.get("name") or "").upper()
+    if ticker.startswith("FX_IDC:") and ticker.endswith("USD") and len(ticker) > 10:
+        return ticker[len("FX_IDC:") : -3]
+    if ":" in ticker:
+        pair = ticker.split(":", 1)[1]
+        if pair.endswith("USD") and len(pair) >= 6:
+            return pair[:-3]
+    if name.endswith("USD") and len(name) >= 6 and name.isalpha():
+        return name[:-3]
+    return None
+
+
+def _fetch_fx_to_usd(currencies: Sequence[str]) -> dict[str, Optional[float]]:
+    """Batch-fetch FX_IDC:{CCY}USD close rates. Missing → None (no crash)."""
+    rates: dict[str, Optional[float]] = {"USD": 1.0}
+    needed = sorted({
+        str(c).strip().upper()
+        for c in currencies
+        if c and str(c).strip().upper() not in ("", "USD")
+    })
+    if not needed:
+        return rates
+
+    tickers = [f"FX_IDC:{ccy}USD" for ccy in needed]
+    try:
+        query = (
+            Query()
+            .set_tickers(*tickers)
+            .select("name", "close")
+            .limit(len(tickers))
+        )
+        _total, df = query.get_scanner_data(timeout=20)
+    except Exception:
+        for ccy in needed:
+            rates[ccy] = None
+        return rates
+
+    by_ccy: dict[str, Any] = {}
+    for r in df.to_dict("records"):
+        ccy = _fx_ccy_from_scanner_row(r)
+        close = _clean(r.get("close"))
+        if ccy and close is not None:
+            by_ccy[ccy] = close
+
+    for ccy in needed:
+        rates[ccy] = by_ccy.get(ccy)
+    return rates
+
+
+def _compute_market_cap_usd(
+    market_cap: Any,
+    currency: Any,
+    country: str,
+    fx_rates: dict[str, Optional[float]],
+) -> tuple[Optional[float], Optional[str]]:
+    """Return (market_cap_usd, limitation_note_or_None)."""
+    if market_cap is None:
+        return None, None
+    try:
+        cap = float(market_cap)
+    except (TypeError, ValueError):
+        return None, None
+
+    if country in _USD_NORMALIZED_MARKETS:
+        return cap, None
+
+    ccy = str(currency).strip().upper() if currency else ""
+    if not ccy:
+        return None, "currency missing; market_cap_usd=null"
+    if ccy == "USD":
+        return cap, None
+
+    rate = fx_rates.get(ccy)
+    if rate is None:
+        return None, f"FX rate unavailable for {ccy}USD; market_cap_usd=null"
+    try:
+        return cap * float(rate), None
+    except (TypeError, ValueError):
+        return None, f"FX rate invalid for {ccy}USD; market_cap_usd=null"
+
+
+def _safe_div_pct(num: Any, den: Any) -> Optional[float]:
+    if num is None or den is None:
+        return None
+    try:
+        d = float(den)
+        if d == 0:
+            return None
+        return 100.0 * float(num) / d
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_sum(a: Any, b: Any) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    try:
+        return float(a) + float(b)
+    except (TypeError, ValueError):
+        return None
+
+
 def screen_stocks(
     country: str = "america",
     stock_type: str = "common",
@@ -165,20 +436,33 @@ def screen_stocks(
     net_debt_to_ebitda_max: Optional[float] = None,
     sector_exclude: Optional[Sequence[str] | str] = None,
     analyst_count_max: Optional[float] = None,
+    gross_margin_min: Optional[float] = None,
+    revenue_growth_yoy_fq_min: Optional[float] = None,
+    rule_of_40_min: Optional[float] = None,
+    primary_only: bool = False,
+    market_cap_usd_min: Optional[float] = None,
+    market_cap_usd_max: Optional[float] = None,
 ) -> dict[str, Any]:
     """Screen stocks of one share type for a country market.
 
-    Returns an envelope: total_matches is the market-wide count, rows are the
-    top-N by sort_by (always descending, server-side, so the ranking covers
-    the WHOLE filtered set, not just a client-side window).
+    Returns an envelope: total_matches / tv_total_matches is the market-wide
+    TV where count; rows are the top-N by sort_by. When post-filters
+    (rule_of_40_min, market_cap_usd_*) or computed sort are used, the scanner
+    over-fetches limit×K, then compute → filter → re-sort → truncate.
 
     Optional fundamental filters are AND-combined. Units (verified live):
-      - market_cap_* : USD
-      - revenue_growth_yoy_min : percent (15 means +15% YoY TTM)
-      - fcf_min / fcf_positive : free_cash_flow_ttm in USD
+      - market_cap_min/max : raw market_cap_basic (NOT always USD — see
+        market_cap_usd / API_LIMITATIONS)
+      - market_cap_usd_min/max : computed USD cap (post-filter)
+      - revenue_growth_yoy_min : percent TTM (15 = +15% YoY TTM)
+      - revenue_growth_yoy_fq_min : percent latest quarter YoY
+      - gross_margin_min : gross_margin_ttm percent
+      - rule_of_40_min : rule_of_40_fq (FQ YoY + TTM FCF margin)
+      - fcf_min / fcf_positive : free_cash_flow_ttm absolute
       - net_debt_to_ebitda_max : ratio on net_debt_to_ebitda_fq
       - sector_exclude : TradingView sector names (e.g. "Finance")
       - analyst_count_max : recommendation_total (proxy — see API_LIMITATIONS)
+      - primary_only : is_primary==True (common stock only; preferred raises)
 
     exclude_otc (default True): TradingView's 'america' market means "trades
     on a US venue", not "is a US company" — without this filter ~1/3 of the
@@ -200,17 +484,24 @@ def screen_stocks(
         raise ValueError(
             f"stock_type must be one of {list(STOCK_TYPES)}, got {stock_type!r}"
         )
+    if primary_only and stock_type == "preferred":
+        raise ValueError(
+            "primary_only=True is not supported with stock_type='preferred' "
+            "(preferred shares are almost never primary — scan would return 0)"
+        )
     country = (country or "america").strip().lower()
     limit = max(1, min(int(limit), MAX_SCREEN_LIMIT))
     sort_key = (sort_by or "market_cap").strip().lower()
+    computed_sort_col = _COMPUTED_SORT_FIELDS.get(sort_key)
     sort_col = SORT_FIELDS.get(sort_key)
-    if not sort_col:
+    if sort_col is None and computed_sort_col is None:
+        allowed = list(SORT_FIELDS) + list(_COMPUTED_SORT_FIELDS)
         raise ValueError(
-            f"sort_by must be one of {list(SORT_FIELDS)}, got {sort_by!r}"
+            f"sort_by must be one of {allowed}, got {sort_by!r}"
         )
 
     sectors = _normalize_sector_exclude(sector_exclude)
-    use_fundamentals = _any_fundamental_filter(
+    legacy_filters = _any_legacy_fundamental_filter(
         market_cap_min,
         market_cap_max,
         revenue_growth_yoy_min,
@@ -220,10 +511,39 @@ def screen_stocks(
         sectors,
         analyst_count_max,
     )
+    new_filters = _any_new_fundamental_filter(
+        gross_margin_min,
+        revenue_growth_yoy_fq_min,
+        rule_of_40_min,
+        primary_only,
+        market_cap_usd_min,
+        market_cap_usd_max,
+    )
+    # Extended payload iff any NEW filter or NEW sort key (incl. rule_of_40).
+    extended_payload = new_filters or sort_key in _NEW_SORT_KEYS
+    # Legacy audit payload: pre-101 fund filters/sorts, and no new features.
+    legacy_payload = (
+        not extended_payload
+        and (
+            legacy_filters
+            or sort_key in _LEGACY_FUND_SORT_KEYS
+        )
+    )
+    use_fundamentals = extended_payload or legacy_payload
+
+    needs_post = _needs_post_filter(
+        rule_of_40_min,
+        market_cap_usd_min,
+        market_cap_usd_max,
+        computed_sort=computed_sort_col is not None,
+    )
 
     if market_cap_min is not None and market_cap_max is not None:
         if float(market_cap_min) > float(market_cap_max):
             raise ValueError("market_cap_min must be <= market_cap_max")
+    if market_cap_usd_min is not None and market_cap_usd_max is not None:
+        if float(market_cap_usd_min) > float(market_cap_usd_max):
+            raise ValueError("market_cap_usd_min must be <= market_cap_usd_max")
     if fcf_positive is not None and fcf_min is not None and bool(fcf_positive) and float(fcf_min) <= 0:
         # fcf_min is the stricter numeric bound when both are set.
         pass
@@ -232,17 +552,55 @@ def screen_stocks(
     if exclude_otc:
         filters.append(col("exchange") != "OTC")
 
-    if market_cap_min is not None and market_cap_max is not None:
-        filters.append(col("market_cap_basic").between(float(market_cap_min), float(market_cap_max)))
-    elif market_cap_min is not None:
-        filters.append(col("market_cap_basic") >= float(market_cap_min))
-    elif market_cap_max is not None:
-        filters.append(col("market_cap_basic") <= float(market_cap_max))
+    # On USD-normalized markets market_cap_usd ≈ market_cap_basic, so push
+    # USD caps into the TV where (otherwise over-fetch of top raw caps can
+    # miss the entire mid-cap USD band). Non-USD markets keep post-filter only.
+    tv_cap_min = market_cap_min
+    tv_cap_max = market_cap_max
+    if country in _USD_NORMALIZED_MARKETS:
+        if market_cap_usd_min is not None:
+            tv_cap_min = (
+                max(float(tv_cap_min), float(market_cap_usd_min))
+                if tv_cap_min is not None
+                else float(market_cap_usd_min)
+            )
+        if market_cap_usd_max is not None:
+            tv_cap_max = (
+                min(float(tv_cap_max), float(market_cap_usd_max))
+                if tv_cap_max is not None
+                else float(market_cap_usd_max)
+            )
+        if (
+            tv_cap_min is not None
+            and tv_cap_max is not None
+            and float(tv_cap_min) > float(tv_cap_max)
+        ):
+            raise ValueError(
+                "market_cap_* / market_cap_usd_* intersection is empty "
+                f"(effective min={tv_cap_min} > max={tv_cap_max})"
+            )
+
+    if tv_cap_min is not None and tv_cap_max is not None:
+        filters.append(
+            col("market_cap_basic").between(float(tv_cap_min), float(tv_cap_max))
+        )
+    elif tv_cap_min is not None:
+        filters.append(col("market_cap_basic") >= float(tv_cap_min))
+    elif tv_cap_max is not None:
+        filters.append(col("market_cap_basic") <= float(tv_cap_max))
 
     if revenue_growth_yoy_min is not None:
         filters.append(
             col("total_revenue_yoy_growth_ttm") >= float(revenue_growth_yoy_min)
         )
+
+    if revenue_growth_yoy_fq_min is not None:
+        filters.append(
+            col("total_revenue_yoy_growth_fq") >= float(revenue_growth_yoy_fq_min)
+        )
+
+    if gross_margin_min is not None:
+        filters.append(col("gross_margin_ttm") >= float(gross_margin_min))
 
     # fcf_min wins when both are provided (stricter absolute floor).
     if fcf_min is not None:
@@ -263,21 +621,38 @@ def screen_stocks(
     if analyst_count_max is not None:
         filters.append(col("recommendation_total") <= float(analyst_count_max))
 
+    if primary_only:
+        filters.append(col("is_primary") == True)  # noqa: E712 — TV col API
+
     select_cols = list(_SCREEN_COLUMNS)
-    if use_fundamentals or sort_col in _FUNDAMENTAL_COLUMNS:
+    if extended_payload:
         for c in _FUNDAMENTAL_COLUMNS:
             if c not in select_cols:
                 select_cols.append(c)
-    if sort_col not in select_cols:
+    elif legacy_payload:
+        for c in _LEGACY_FUNDAMENTAL_COLUMNS:
+            if c not in select_cols:
+                select_cols.append(c)
+    if sort_col is not None and sort_col not in select_cols:
         select_cols.append(sort_col)
+
+    # TV order_by: computed sorts fall back to market_cap for the over-fetch
+    # window, then client re-sorts.
+    tv_order_col = sort_col if sort_col is not None else "market_cap_basic"
+    if tv_order_col not in select_cols:
+        select_cols.append(tv_order_col)
+
+    fetch_limit = limit
+    if needs_post:
+        fetch_limit = min(MAX_SCREEN_LIMIT, limit * _POST_FILTER_OVERFETCH_K)
 
     query = (
         Query()
         .set_markets(country)
         .select(*select_cols)
         .where(*filters)
-        .order_by(sort_col, ascending=False)
-        .limit(limit)
+        .order_by(tv_order_col, ascending=False)
+        .limit(fetch_limit)
     )
     # get_scanner_data forwards kwargs to requests.post, which has no default
     # timeout — a stalled endpoint would hang the worker thread forever.
@@ -290,6 +665,20 @@ def screen_stocks(
         applied_filters["market_cap_max"] = float(market_cap_max)
     if revenue_growth_yoy_min is not None:
         applied_filters["revenue_growth_yoy_min"] = float(revenue_growth_yoy_min)
+    if revenue_growth_yoy_fq_min is not None:
+        applied_filters["revenue_growth_yoy_fq_min"] = float(
+            revenue_growth_yoy_fq_min
+        )
+    if gross_margin_min is not None:
+        applied_filters["gross_margin_min"] = float(gross_margin_min)
+    if rule_of_40_min is not None:
+        applied_filters["rule_of_40_min"] = float(rule_of_40_min)
+    if market_cap_usd_min is not None:
+        applied_filters["market_cap_usd_min"] = float(market_cap_usd_min)
+    if market_cap_usd_max is not None:
+        applied_filters["market_cap_usd_max"] = float(market_cap_usd_max)
+    if primary_only:
+        applied_filters["primary_only"] = True
     if fcf_min is not None:
         applied_filters["fcf_min"] = float(fcf_min)
     elif fcf_positive is not None:
@@ -301,8 +690,23 @@ def screen_stocks(
     if analyst_count_max is not None:
         applied_filters["analyst_count_max"] = float(analyst_count_max)
 
-    rows = []
-    for r in df.to_dict("records"):
+    raw_records = df.to_dict("records")
+    fx_notes: list[str] = []
+    fx_rates: dict[str, Optional[float]] = {"USD": 1.0}
+    if extended_payload:
+        currencies = [_clean(r.get("currency")) for r in raw_records]
+        need_fx = country not in _USD_NORMALIZED_MARKETS and any(
+            c and str(c).upper() != "USD" for c in currencies
+        )
+        if need_fx:
+            fx_rates = _fetch_fx_to_usd(
+                [str(c) for c in currencies if c is not None]
+            )
+
+    rows: list[dict[str, Any]] = []
+    for r in raw_records:
+        market_cap = _clean(r.get("market_cap_basic"))
+        currency = _clean(r.get("currency"))
         row: dict[str, Any] = {
             "ticker": _clean(r.get("ticker")),
             "symbol": _clean(r.get("name")),
@@ -312,14 +716,41 @@ def screen_stocks(
             "open": _clean(r.get("open")),
             "high": _clean(r.get("high")),
             "low": _clean(r.get("low")),
-            "currency": _clean(r.get("currency")),
+            "currency": currency,
             "change_percent": _clean(r.get("change")),
             "dividend_yield": _clean(r.get("dividends_yield_current")),
-            "market_cap": _clean(r.get("market_cap_basic")),
+            "market_cap": market_cap,
         }
-        if use_fundamentals or sort_col in _FUNDAMENTAL_COLUMNS:
-            # Always echo filter-relevant fundamentals when any fund filter
-            # ran — even columns that weren't constrained — for auditability.
+        if extended_payload:
+            rev_ttm = _clean(r.get("total_revenue_yoy_growth_ttm"))
+            rev_fq = _clean(r.get("total_revenue_yoy_growth_fq"))
+            revenue_ttm = _clean(r.get("total_revenue_ttm"))
+            fcf = _clean(r.get("free_cash_flow_ttm"))
+            fcf_margin = _safe_div_pct(fcf, revenue_ttm)
+            row["revenue_growth_yoy_ttm"] = rev_ttm
+            row["revenue_growth_yoy_fq"] = rev_fq
+            row["total_revenue_ttm"] = revenue_ttm
+            row["gross_margin_ttm"] = _clean(r.get("gross_margin_ttm"))
+            row["free_cash_flow_ttm"] = fcf
+            row["price_free_cash_flow_ttm"] = _clean(
+                r.get("price_free_cash_flow_ttm")
+            )
+            row["fcf_margin_ttm"] = fcf_margin
+            row["rule_of_40_ttm"] = _safe_sum(rev_ttm, fcf_margin)
+            row["rule_of_40_fq"] = _safe_sum(rev_fq, fcf_margin)
+            row["net_debt_to_ebitda_fq"] = _clean(r.get("net_debt_to_ebitda_fq"))
+            row["sector"] = _clean(r.get("sector"))
+            row["industry"] = _clean(r.get("industry"))
+            row["is_primary"] = _clean(r.get("is_primary"))
+            row["analyst_count"] = _clean(r.get("recommendation_total"))
+            mcap_usd, note = _compute_market_cap_usd(
+                market_cap, currency, country, fx_rates
+            )
+            row["market_cap_usd"] = mcap_usd
+            if note and note not in fx_notes:
+                fx_notes.append(note)
+        elif legacy_payload:
+            # Pre-101 audit keys only — no new response fields.
             row["revenue_growth_yoy_ttm"] = _clean(
                 r.get("total_revenue_yoy_growth_ttm")
             )
@@ -332,20 +763,71 @@ def screen_stocks(
             row["analyst_count"] = _clean(r.get("recommendation_total"))
         rows.append(row)
 
+    post_filter_incomplete = False
+    if needs_post:
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            if rule_of_40_min is not None:
+                ro40 = row.get("rule_of_40_fq")
+                if ro40 is None or float(ro40) < float(rule_of_40_min):
+                    continue
+            if market_cap_usd_min is not None:
+                mu = row.get("market_cap_usd")
+                if mu is None or float(mu) < float(market_cap_usd_min):
+                    continue
+            if market_cap_usd_max is not None:
+                mu = row.get("market_cap_usd")
+                if mu is None or float(mu) > float(market_cap_usd_max):
+                    continue
+            filtered.append(row)
+        # Incomplete iff TV where-set is larger than the over-fetch window
+        # (passers may exist outside the page). Uses tv total, not page fullness.
+        post_filter_incomplete = _post_filter_incomplete(total, fetch_limit)
+        rows = filtered
+
+        # Re-sort after post-filter (especially for computed sort_by).
+        sort_row_key = computed_sort_col
+        if sort_row_key is None and sort_key == "gross_margin":
+            sort_row_key = "gross_margin_ttm"
+        elif sort_row_key is None and sort_key == "revenue_growth_fq":
+            sort_row_key = "revenue_growth_yoy_fq"
+        elif sort_row_key is None and sort_key == "revenue_growth":
+            sort_row_key = "revenue_growth_yoy_ttm"
+        elif sort_row_key is None and sort_key == "fcf":
+            sort_row_key = "free_cash_flow_ttm"
+        elif sort_row_key is None and sort_key == "net_debt_ebitda":
+            sort_row_key = "net_debt_to_ebitda_fq"
+        elif sort_row_key is None and sort_key == "market_cap":
+            sort_row_key = "market_cap"
+        elif sort_row_key is None and sort_key == "dividend_yield":
+            sort_row_key = "dividend_yield"
+        elif sort_row_key is None and sort_key == "change":
+            sort_row_key = "change_percent"
+        elif sort_row_key is None and sort_key == "price":
+            sort_row_key = "price"
+
+        if sort_row_key:
+
+            def _sort_val(item: dict[str, Any]) -> float:
+                v = item.get(sort_row_key)  # type: ignore[arg-type]
+                if v is None:
+                    return float("-inf")
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return float("-inf")
+
+            rows.sort(key=_sort_val, reverse=True)
+
+        rows = rows[:limit]
+    # When no post-filter, TV already limited to `limit`.
+
     if compact:
         keep = ["ticker", "symbol", "price", "currency", "change_percent"]
-        if use_fundamentals or sort_col in _FUNDAMENTAL_COLUMNS:
-            keep.extend(
-                [
-                    "market_cap",
-                    "revenue_growth_yoy_ttm",
-                    "free_cash_flow_ttm",
-                    "price_free_cash_flow_ttm",
-                    "net_debt_to_ebitda_fq",
-                    "sector",
-                    "analyst_count",
-                ]
-            )
+        if extended_payload:
+            keep.extend(list(_EXTENDED_FUND_AUDIT_KEYS))
+        elif legacy_payload:
+            keep.extend(list(_LEGACY_FUND_AUDIT_KEYS))
         rows = [{k: r[k] for k in keep if k in r} for r in rows]
 
     result: dict[str, Any] = {
@@ -358,8 +840,18 @@ def screen_stocks(
         "returned": len(rows),
         "rows": rows,
     }
-    if use_fundamentals:
-        result["api_limitations"] = list(API_LIMITATIONS)
+    # New envelope keys only on extended / post-filter paths (legacy BC).
+    if extended_payload or needs_post:
+        result["tv_total_matches"] = total
+    if needs_post:
+        result["fetch_limit"] = fetch_limit
+        result["post_filter_incomplete"] = post_filter_incomplete
+    if extended_payload:
+        limitations = list(API_LIMITATIONS)
+        limitations.extend(fx_notes)
+        result["api_limitations"] = limitations
+    elif legacy_payload:
+        result["api_limitations"] = list(_LEGACY_API_LIMITATIONS)
     return result
 
 

@@ -439,24 +439,31 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 
 | Tool | Description |
 |------|-------------|
-| `stock_screener` | List common or preferred stocks for any TradingView country market (america, korea, germany, brazil, …) with price, currency, % change, dividend yield — ranked by market cap. Optional **AND-combined fundamental filters** for multi-criteria screening (market cap range, revenue YoY growth, FCF, net debt/EBITDA, sector exclude, analyst-coverage proxy). The API twin of TradingView's "Common stock" / "Preferred stock" symbol-search filter. |
+| `stock_screener` | List common or preferred stocks for any TradingView country market with price, currency, % change, dividend yield — ranked by market cap. Optional **AND-combined fundamental filters** (raw/USD market cap, TTM + FQ revenue YoY, gross margin, Rule of 40, FCF, net debt/EBITDA, sector/industry, primary listing, analyst-coverage proxy). **BC:** new audit keys appear only when any new filter or new sort key is used; legacy fund calls keep the pre-101 key set. The API twin of TradingView's "Common stock" / "Preferred stock" symbol-search filter. |
 | `stock_prices` | Direct price lookup for specific symbols (comma-separated `EXCHANGE:SYMBOL`, e.g. `NASDAQ:NVDA, KRX:005930`) — price, currency, daily % change, with unrecognized tickers named in `not_found`. |
 
 **Fundamental filter params** (all optional, AND-combined; verified against live `scanner.tradingview.com` metainfo):
 
-| Param | Scanner field | Notes |
+| Param | Scanner / computed field | Notes |
 |------|---------------|-------|
-| `market_cap_min` / `market_cap_max` | `market_cap_basic` | USD |
+| `market_cap_min` / `market_cap_max` | `market_cap_basic` | Raw — **not always USD** (e.g. sweden = SEK) |
+| `market_cap_usd_min` / `market_cap_usd_max` | computed `market_cap_usd` | Post-filter; america/germany/canada = raw; else `FX_IDC:{CCY}USD` |
 | `revenue_growth_yoy_min` | `total_revenue_yoy_growth_ttm` | Percent (15 = +15% YoY TTM) |
-| `fcf_positive` / `fcf_min` | `free_cash_flow_ttm` | USD; `fcf_min` wins if both set |
+| `revenue_growth_yoy_fq_min` | `total_revenue_yoy_growth_fq` | Latest quarter YoY % |
+| `gross_margin_min` | `gross_margin_ttm` | Percent |
+| `rule_of_40_min` | `rule_of_40_fq` | FQ YoY + TTM FCF margin; post-filter on over-fetch window |
+| `fcf_positive` / `fcf_min` | `free_cash_flow_ttm` | Absolute; `fcf_min` wins if both set |
 | `net_debt_to_ebitda_max` | `net_debt_to_ebitda_fq` | Exclude banks/insurers via `sector_exclude` |
 | `sector_exclude` | `sector` | e.g. `["Finance"]` |
 | `analyst_count_max` | `recommendation_total` | Proxy only — see limitations |
+| `primary_only` | `is_primary` | Common stock only (preferred raises) |
 
 **Known API gaps / fragility**
 
 - There is **no** dedicated `number_of_analysts` field; `recommendation_total` (buy+hold+sell+over+under) is the closest proxy exposed as `analyst_count`.
 - There is **no** standalone FCF-yield field; when fundamentals are requested the response includes `price_free_cash_flow_ttm` (P/FCF) instead.
+- There is **no** previous-quarter revenue YoY on the scanner — only latest FQ YoY.
+- `rule_of_40_min` / `market_cap_usd_*` / `sort_by=rule_of_40` run on an over-fetched window (`limit×5`); `post_filter_incomplete=true` means `tv_total_matches > fetch_limit` (passers may exist outside the window).
 - This tool calls TradingView's **undocumented** scanner endpoint (`https://scanner.tradingview.com/<market>/scan`). Field names, operators, or access can change or be rate-limited without notice — treat as a known breakage point for automation.
 
 ---
