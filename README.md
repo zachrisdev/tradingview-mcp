@@ -465,7 +465,7 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 - There is **no** standalone FCF-yield field; when fundamentals are requested the response includes `price_free_cash_flow_ttm` (P/FCF) instead.
 - There is **no** previous-quarter revenue YoY on the scanner — only latest FQ YoY.
 - TV `gross_margin_*` uses TV Gross profit / COGS (often includes D&A that issuers report below GP — e.g. PAYS); CGNT/MNDY usually match company figures.
-- `rule_of_40_min` / `market_cap_usd_*` / `gross_margin_fq_min` / `sort_by=rule_of_40|gross_margin_fq` over-fetch pages (`limit×5`, max 3 pages with offset); `post_filter_incomplete=true` means unscanned TV where-rows remain. On that path `total_matches` is the passer count only when fully scanned, else `null` (`tv_total_matches` = TV raw where count).
+- `rule_of_40_min` / `market_cap_usd_*` / `gross_margin_fq_min` / `sort_by=rule_of_40|gross_margin_fq` page the TV where-set (page size 1000, default `max_scan_rows=5000`) then filter/sort client-side. `total_matches` = passer count among scanned rows; if `tv_total_matches > max_scan_rows` → `post_filter_incomplete=true` + `warning`. Native-column sorts stay a single TV request.
 - This tool calls TradingView's **undocumented** scanner endpoint (`https://scanner.tradingview.com/<market>/scan`). Field names, operators, or access can change or be rate-limited without notice — treat as a known breakage point for automation.
 
 ---

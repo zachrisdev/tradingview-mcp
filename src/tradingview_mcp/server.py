@@ -1126,6 +1126,7 @@ async def stock_screener(
     market_cap_usd_min: float | None = None,
     market_cap_usd_max: float | None = None,
     gross_margin_fq_min: float | None = None,
+    max_scan_rows: int | None = None,
 ) -> dict:
     """Screen stocks by share type — the API twin of TradingView's
     "Common stock" / "Preferred stock" symbol-search filter.
@@ -1146,9 +1147,9 @@ async def stock_screener(
             fundamental filters are used, those audit columns are kept
         sort_by: market_cap (default) | dividend_yield | change | price |
             revenue_growth | revenue_growth_fq | gross_margin | gross_margin_fq |
-            fcf | net_debt_ebitda | rule_of_40. TV-column sorts are server-side
-            over the TV where set; rule_of_40 / gross_margin_fq are client
-            post-sorts on over-fetched pages (not a full-market guarantee)
+            fcf | net_debt_ebitda | rule_of_40. Native-column sorts are a single
+            TV-side request; rule_of_40 / gross_margin_fq page the TV where-set
+            (up to max_scan_rows) then rank client-side
         market_cap_min / market_cap_max: raw market_cap_basic (NOT always USD —
             sweden etc. are local; use market_cap_usd_* for USD caps)
         market_cap_usd_min / market_cap_usd_max: computed USD cap post-filter
@@ -1175,19 +1176,23 @@ async def stock_screener(
             is returned instead. No previous-quarter revenue YoY on scanner.
             TV gross_margin_* uses TV COGS (may include D&A).
         primary_only: if True, require is_primary (common only — preferred raises)
+        max_scan_rows: hard cap for post-filter / computed-sort paging
+            (default 5000, max 10000). If TV where > max_scan_rows, envelope
+            sets post_filter_incomplete=true and warning.
 
     Fragility: uses TradingView's undocumented scanner API
     (scanner.tradingview.com/<market>/scan). Field names/operators can change
     or be rate-limited without notice.
 
     Returns:
-        Envelope: total_matches (TV where count, or passer count / null on
-        post-filter paths), tv_total_matches, returned, filters_applied,
-        rows with base price fields plus — when any fundamental filter is set —
+        Envelope: total_matches (TV where count, or passer count on post-filter
+        paths), tv_total_matches, returned, filters_applied, rows with base
+        price fields plus — when any fundamental filter is set —
         revenue_growth_yoy_ttm/fq, total_revenue_ttm, gross_margin_ttm/fq,
         free_cash_flow_ttm, fcf_margin_ttm, rule_of_40_ttm/fq, market_cap_usd,
         industry, is_primary, sector, analyst_count, P/FCF. Post-filter paths
-        also set fetch_limit and post_filter_incomplete.
+        also set max_scan_rows, scanned_rows, fetch_limit, post_filter_incomplete,
+        and optionally warning.
     """
     try:
         # tradingview-screener is sync (urllib) — off-load to a worker thread
@@ -1215,6 +1220,7 @@ async def stock_screener(
             market_cap_usd_min,
             market_cap_usd_max,
             gross_margin_fq_min,
+            max_scan_rows,
         )
     except ValueError as e:
         return make_error(ErrorCode.INVALID_PARAMETER, str(e))

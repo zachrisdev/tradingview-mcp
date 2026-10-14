@@ -84,12 +84,11 @@ _FUNDAMENTAL_COLUMNS = _LEGACY_FUNDAMENTAL_COLUMNS + _EXTENDED_FUNDAMENTAL_COLUM
 
 MAX_SCREEN_LIMIT = 2000
 MAX_PRICE_TICKERS = 2000
-# Over-fetch multiplier when post-filters (Ro40 / market_cap_usd / GM FQ) are
-# active so the TV .limit window is not the only search space.
-_POST_FILTER_OVERFETCH_K = 5
-# Max scanner pages (offset rounds) when post-filtering and the first page
-# does not fill `limit` with passers.
-_POST_FILTER_MAX_PAGES = 3
+# Post-filter / computed-sort scan: page through the TV where-set (ordered by
+# market_cap_basic when the sort is computed) until exhausted or max_scan_rows.
+_POST_FILTER_PAGE_SIZE = 1000
+_DEFAULT_MAX_SCAN_ROWS = 5000
+_MAX_SCAN_ROWS_CAP = 10000
 
 # sort_by -> scanner column (TV server-side). Computed sorts are handled
 # client-side after over-fetch (see _COMPUTED_SORT_FIELDS).
@@ -152,14 +151,15 @@ _EXTENDED_API_LIMITATIONS = (
     "TV where there); other markets convert via FX_IDC:{CCY}USD into "
     "market_cap_usd and filter client-side only. Raw market_cap_min/max "
     "always filter market_cap_basic.",
-    "Post-filters (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min, "
-    "sort_by=rule_of_40|gross_margin_fq) over-fetch pages of size limit×K "
-    "and may page with offset (max "
-    f"{_POST_FILTER_MAX_PAGES} pages). post_filter_incomplete=true means "
-    "unscanned TV where-rows remain (passers may exist outside). On this "
-    "path total_matches is the passer count only when the TV where-set was "
-    "fully scanned; otherwise null (use tv_total_matches for the TV raw "
-    "where count).",
+    "Post-filters (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min) "
+    "and computed sorts (rule_of_40, gross_margin_fq) page through the TV "
+    f"where-set (page size {_POST_FILTER_PAGE_SIZE}, default max_scan_rows="
+    f"{_DEFAULT_MAX_SCAN_ROWS}) in market_cap order, then filter/sort "
+    "client-side. total_matches is the passer count among scanned rows. "
+    "post_filter_incomplete=true (+ warning) when tv_total_matches > "
+    "max_scan_rows — ranking covers only the first N market_cap rows. "
+    "Native-column sorts (market_cap, revenue_growth, gross_margin, …) "
+    "remain a single TV-side request.",
 )
 
 API_LIMITATIONS = _LEGACY_API_LIMITATIONS + _EXTENDED_API_LIMITATIONS
@@ -204,7 +204,10 @@ _NEW_RESPONSE_KEYS = frozenset({
     "is_primary",
     "tv_total_matches",
     "fetch_limit",
+    "max_scan_rows",
+    "scanned_rows",
     "post_filter_incomplete",
+    "warning",
 })
 
 
@@ -555,16 +558,17 @@ def screen_stocks(
     market_cap_usd_min: Optional[float] = None,
     market_cap_usd_max: Optional[float] = None,
     gross_margin_fq_min: Optional[float] = None,
+    max_scan_rows: Optional[int] = None,
 ) -> dict[str, Any]:
     """Screen stocks of one share type for a country market.
 
-    Returns an envelope: total_matches is the TV where count on non-post-filter
-    paths; on post-filter paths it is the passer count when the TV where-set
-    was fully scanned, else null (see tv_total_matches). Rows are the top-N
-    by sort_by. When post-filters (rule_of_40_min, market_cap_usd_*,
-    gross_margin_fq_min) or computed sort are used, the scanner over-fetches
-    pages of size limit×K (max 3 pages with offset), then compute → filter
-    → re-sort → truncate.
+    Returns an envelope: total_matches is the TV where count on native-sort
+    paths; on post-filter / computed-sort paths it is the passer count among
+    scanned rows. Rows are the top-N by sort_by. Post-filters
+    (rule_of_40_min, market_cap_usd_*, gross_margin_fq_min) and computed
+    sorts page the full TV where-set (page size 1000, up to max_scan_rows)
+    in market_cap order, then compute → filter → re-sort → truncate.
+    Native-column sorts stay a single TV request of size ``limit``.
 
     Optional fundamental filters are AND-combined. Units (verified live):
       - market_cap_min/max : raw market_cap_basic (NOT always USD — see
@@ -581,6 +585,8 @@ def screen_stocks(
       - sector_exclude : TradingView sector names (e.g. "Finance")
       - analyst_count_max : recommendation_total (proxy — see API_LIMITATIONS)
       - primary_only : is_primary==True (common stock only; preferred raises)
+      - max_scan_rows : hard cap for post-filter / computed-sort paging
+        (default 5000, max 10000)
 
     exclude_otc (default True): TradingView's 'america' market means "trades
     on a US venue", not "is a US company" — without this filter ~1/3 of the
@@ -609,6 +615,18 @@ def screen_stocks(
         )
     country = (country or "america").strip().lower()
     limit = max(1, min(int(limit), MAX_SCREEN_LIMIT))
+    if max_scan_rows is None:
+        scan_cap = _DEFAULT_MAX_SCAN_ROWS
+    else:
+        try:
+            scan_cap = int(max_scan_rows)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"max_scan_rows must be an int, got {max_scan_rows!r}"
+            ) from exc
+        if scan_cap < 1:
+            raise ValueError("max_scan_rows must be >= 1")
+        scan_cap = min(scan_cap, _MAX_SCAN_ROWS_CAP)
     sort_key = (sort_by or "market_cap").strip().lower()
     computed_sort_col = _COMPUTED_SORT_FIELDS.get(sort_key)
     sort_col = SORT_FIELDS.get(sort_key)
@@ -756,15 +774,13 @@ def screen_stocks(
     if sort_col is not None and sort_col not in select_cols:
         select_cols.append(sort_col)
 
-    # TV order_by: computed sorts fall back to market_cap for the over-fetch
-    # window, then client re-sorts.
+    # TV order_by: computed sorts fall back to market_cap while paging the
+    # where-set; client re-sorts after compute/post-filter.
     tv_order_col = sort_col if sort_col is not None else "market_cap_basic"
     if tv_order_col not in select_cols:
         select_cols.append(tv_order_col)
 
-    fetch_limit = limit
-    if needs_post:
-        fetch_limit = min(MAX_SCREEN_LIMIT, limit * _POST_FILTER_OVERFETCH_K)
+    page_size = limit if not needs_post else _POST_FILTER_PAGE_SIZE
 
     applied_filters: dict[str, Any] = {}
     if market_cap_min is not None:
@@ -889,28 +905,34 @@ def screen_stocks(
     total = 0
     scanned = 0
     post_filter_incomplete = False
+    warning: Optional[str] = None
     passer_count: Optional[int] = None
 
-    max_pages = _POST_FILTER_MAX_PAGES if needs_post else 1
     offset = 0
     seen: set[str] = set()
     passers: list[dict[str, Any]] = []
+    page_idx = 0
 
-    for _page in range(max_pages):
+    while True:
         # TV range is [start, end); never pass limit=page_size with nonzero
         # offset (that yields [N, N] → data:null / TypeError in the lib).
+        remaining = scan_cap - scanned if needs_post else page_size
+        if needs_post and remaining <= 0:
+            break
+        this_page = min(page_size, remaining) if needs_post else page_size
+
         total, raw_records = _fetch_stock_scanner_page(
             country,
             select_cols,
             filters,
             tv_order_col,
             offset,
-            fetch_limit,
+            this_page,
         )
         if not raw_records:
             break
 
-        if extended_payload and _page == 0:
+        if extended_payload and page_idx == 0:
             currencies = [_clean(r.get("currency")) for r in raw_records]
             need_fx = country not in _USD_NORMALIZED_MARKETS and any(
                 c and str(c).upper() != "USD" for c in currencies
@@ -920,7 +942,6 @@ def screen_stocks(
                     [str(c) for c in currencies if c is not None]
                 )
         elif extended_payload and country not in _USD_NORMALIZED_MARKETS:
-            # Later pages may introduce new quote currencies.
             page_ccys = [
                 str(c)
                 for c in (_clean(r.get("currency")) for r in raw_records)
@@ -933,6 +954,7 @@ def screen_stocks(
         page_rows = [_row_from_raw(r, fx_rates, fx_notes) for r in raw_records]
         scanned += len(page_rows)
         offset += len(raw_records)
+        page_idx += 1
 
         if needs_post:
             for row in page_rows:
@@ -943,8 +965,9 @@ def screen_stocks(
                     seen.add(ticker)
                 if _passes_post(row):
                     passers.append(row)
-            # Continue paging only while under limit and TV rows remain.
-            if len(passers) >= limit or scanned >= int(total):
+            # Exhaust the where-set (or hit scan_cap) — do NOT stop early
+            # when passers >= limit (would silently truncate the ranking).
+            if scanned >= int(total) or scanned >= scan_cap:
                 break
         else:
             rows = page_rows
@@ -952,6 +975,12 @@ def screen_stocks(
 
     if needs_post:
         post_filter_incomplete = _post_filter_incomplete(scanned, total)
+        if post_filter_incomplete:
+            warning = (
+                f"a rangsor csak az első {scanned} (market_cap szerint) "
+                f"sorból készült — szűkíts a TV-oldali szűrőkkel "
+                f"(tv_total_matches={total}, max_scan_rows={scan_cap})"
+            )
         # Re-sort after post-filter (especially for computed sort_by).
         sort_row_key = computed_sort_col
         if sort_row_key is None and sort_key == "gross_margin":
@@ -988,7 +1017,7 @@ def screen_stocks(
 
             passers.sort(key=_sort_val, reverse=True)
 
-        passer_count = len(passers) if not post_filter_incomplete else None
+        passer_count = len(passers)
         rows = passers[:limit]
     # When no post-filter, TV already limited to `limit`.
 
@@ -1014,17 +1043,16 @@ def screen_stocks(
     if extended_payload or needs_post:
         result["tv_total_matches"] = total
     if needs_post:
-        result["fetch_limit"] = fetch_limit
+        # fetch_limit kept as alias of max_scan_rows for older clients/tests.
+        result["fetch_limit"] = scan_cap
+        result["max_scan_rows"] = scan_cap
+        result["scanned_rows"] = scanned
         result["post_filter_incomplete"] = post_filter_incomplete
+        if warning:
+            result["warning"] = warning
     if extended_payload:
         limitations = list(API_LIMITATIONS)
         limitations.extend(fx_notes)
-        if needs_post and post_filter_incomplete:
-            limitations.append(
-                "total_matches is null because post-filter paging did not "
-                "exhaust the TV where-set; tv_total_matches is the TV raw "
-                "where count (not the passer count)."
-            )
         result["api_limitations"] = limitations
     elif legacy_payload:
         result["api_limitations"] = list(_LEGACY_API_LIMITATIONS)
